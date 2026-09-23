@@ -1,0 +1,37 @@
+# Local models for bias-poc-local (Ollama, OpenAI-compatible endpoint).
+# Fields map 1:1 to ModelCfg in spike.py. Changing anything except rpm / concurrency /
+# timeout_s / note changes config_hash, so an existing run id can no longer be resumed.
+#
+# Provenance rule: keep `note` in sync with `ollama list` (ID column) and `ollama --version`
+# every time a model is re-pulled.
+
+models:
+  # Thinking OFF (decision 2026-09-23). With thinking on, 3/22 control answers came back
+  # with empty content (budget exhausted, or final answer left inside `reasoning`).
+  # Verified on ollama 0.34.3: `reasoning_effort: none` disables it on the OpenAI-compatible
+  # endpoint; `think: false` is ignored there.
+  - key: qwen35-4b-nothink
+    provider: openai_compatible
+    model: qwen3.5:4b
+    base_url: http://localhost:11434/v1
+    rpm: 0                 # no limiter needed for a local server
+    concurrency: 1         # one request at a time on an 18GB M3 Pro
+    temperature: 0.7       # >0 so seeds give distinct samples; same value for every model
+    max_tokens: 2000
+    timeout_s: 300
+    seed_base: 1000        # sample i -> seed 1000 + i
+    extra_body:
+      reasoning_effort: none
+    note: "ollama 0.34.3; qwen3.5:4b id 2a654d98e6fb; 4.7B params, Q4_K_M; thinking OFF (reasoning_effort=none)"
+
+  - key: qwen25-1_5b
+    provider: openai_compatible
+    model: qwen2.5:1.5b
+    base_url: http://localhost:11434/v1
+    rpm: 0
+    concurrency: 1
+    temperature: 0.7
+    max_tokens: 2000
+    timeout_s: 300
+    seed_base: 1000
+    note: "ollama 0.34.3; qwen2.5:1.5b id 65ec06548149; 1.5B params, Q4_K_M"

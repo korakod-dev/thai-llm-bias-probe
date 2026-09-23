@@ -1,0 +1,15 @@
+# Raw model outputs (evidence) — never commit unless deliberately publishing them
+bias_poc*.db
+bias_poc*.db-journal
+
+# Label/export working files produced by `spike.py export-csv`
+v3-*.csv
+spike-*.csv
+
+# Derived from prompts_v3.jsonl with grep; regenerate instead of committing
+controls_only.jsonl
+
+# OS / Python noise
+.DS_Store
+__pycache__/
+*.pyc
