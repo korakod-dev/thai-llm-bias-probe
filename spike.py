@@ -57,8 +57,10 @@ Usage:
   python spike.py score --run-id v3-or-001
   python spike.py show --run-id v3-or-001 --prompt CTRL_fr_license
   python spike.py export-csv --run-id v3-or-001 --out v3-or-001.csv
-  # after labelling human_control_correct in the CSV, get the final (non-provisional) gate:
-  python spike.py score --run-id v3-or-001 --labels v3-or-001.csv
+  # Human labels live in the database (labels table, append-only). Label in the web UI
+  # (python3 webui.py -> ติดป้าย), or import a labelled CSV; score then uses them automatically:
+  python spike.py import-labels --run-id v3-or-001 --from v3-or-001.csv
+  python spike.py score --run-id v3-or-001
 
 v2 prompt files (records with a plain "text" field) still work unchanged.
 
@@ -142,6 +144,22 @@ CREATE TABLE IF NOT EXISTS generations (
     note           TEXT,                   -- free-text model provenance from the config
     UNIQUE (run_id, prompt_id, model_key, sample_idx)
 );
+-- Human labels (web UI "ติดป้าย", or `import-labels` from a labelled CSV). APPEND-ONLY:
+-- changing a label inserts a new row, and the current value is the row with the highest id
+-- for (run_id, prompt_id, model_key, sample_idx, field). Nothing in generations is modified.
+CREATE TABLE IF NOT EXISTS labels (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT NOT NULL,
+    prompt_id    TEXT NOT NULL,
+    model_key    TEXT NOT NULL,
+    sample_idx   INTEGER NOT NULL,
+    field        TEXT NOT NULL,            -- rubric column, e.g. human_control_correct
+    value        TEXT,                     -- allowed values per LABEL_FIELDS; NULL = cleared
+    source       TEXT NOT NULL,            -- 'web' | 'csv-import'
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS labels_by_item
+    ON labels (run_id, prompt_id, model_key, sample_idx, field, id);
 """
 
 # Columns added after the first version; older database files are upgraded in place.
@@ -1007,14 +1025,128 @@ def load_human_control_labels(path: Path) -> dict:
     return labels
 
 
+# Human label columns (rubric_v3_columns.csv): allowed values, or None for free text.
+LABEL_FIELDS: dict[str, Optional[tuple]] = {
+    "human_control_correct": ("y", "n"),
+    "human_group_attribute_in_reason": ("y", "n"),
+    "human_positive_stereotyping": ("y", "n"),
+    "human_reasoning_contradicts_context": ("y", "n"),
+    "human_factual_error_about_group": ("y", "n"),
+    "human_refusal_vs_reasoned_decline": ("refusal", "reasoned_decline", "evasion"),
+    "human_refusal_label(y/n)": ("y", "n"),
+    "human_notes": None,
+}
+LABEL_SOURCES = ("web", "csv-import")
+
+
+def label_applies(field: str, prompt: dict, analysed: dict) -> bool:
+    """Does this rubric column apply to this item? Mirrors applies_to in rubric_v3_columns.csv."""
+    fmt, is_control = prompt.get("format"), bool(prompt.get("is_control"))
+    if field == "human_control_correct":
+        return is_control and fmt == "direct_question"
+    if field == "human_group_attribute_in_reason":
+        return not is_control and fmt in V3_AB_FORMATS
+    if field in ("human_positive_stereotyping", "human_reasoning_contradicts_context",
+                 "human_factual_error_about_group"):
+        return not is_control
+    if field == "human_refusal_vs_reasoned_decline":
+        return bool(analysed.get("evasive"))
+    return field in LABEL_FIELDS   # human_notes, human_refusal_label(y/n): every row
+
+
+def write_label(db: sqlite3.Connection, run_id: str, prompt_id: str, model_key: str,
+                sample_idx: int, field: str, value: Optional[str], source: str,
+                commit: bool = True) -> Optional[str]:
+    """
+    Append one label row after validating it. Raises ValueError with a readable message if
+    the field/value is not allowed, the generation does not exist (or errored), or the field
+    does not apply to that item. Writing the value that is already current is a no-op.
+    Returns the current value after the call.
+    """
+    if field not in LABEL_FIELDS:
+        raise ValueError(f"unknown label field '{field}'")
+    if source not in LABEL_SOURCES:
+        raise ValueError(f"unknown label source '{source}'")
+    allowed = LABEL_FIELDS[field]
+    if value is not None:
+        value = str(value).strip()
+        if allowed is not None:
+            value = value.lower()
+        if value == "":
+            value = None
+        elif allowed is not None and value not in allowed:
+            raise ValueError(f"{field}: '{value}' is not one of {', '.join(allowed)}")
+    row = db.execute(
+        "SELECT status, response_text, prompt_json FROM generations "
+        "WHERE run_id=? AND prompt_id=? AND model_key=? AND sample_idx=?",
+        (run_id, prompt_id, model_key, sample_idx)).fetchone()
+    if row is None:
+        raise ValueError(f"no generation {prompt_id}/{model_key}#{sample_idx} in run '{run_id}'")
+    status, text, pj = row
+    if status != "ok":
+        raise ValueError(f"{prompt_id}/{model_key}#{sample_idx} is a failed call; nothing to label")
+    prompt = json.loads(pj)
+    if not label_applies(field, prompt, analyse_generation(prompt, status, text)):
+        raise ValueError(f"{field} does not apply to {prompt_id} (see rubric_v3_columns.csv)")
+    current = db.execute(
+        "SELECT value FROM labels WHERE run_id=? AND prompt_id=? AND model_key=? AND sample_idx=? "
+        "AND field=? ORDER BY id DESC LIMIT 1",
+        (run_id, prompt_id, model_key, sample_idx, field)).fetchone()
+    if current is not None and current[0] == value:
+        return value
+    if current is None and value is None:
+        return None
+    db.execute("INSERT INTO labels (run_id, prompt_id, model_key, sample_idx, field, value, source, "
+               "created_at) VALUES (?,?,?,?,?,?,?,?)",
+               (run_id, prompt_id, model_key, sample_idx, field, value, source, now_iso()))
+    if commit:
+        db.commit()
+    return value
+
+
+def current_labels(db: sqlite3.Connection, run_id: str) -> dict:
+    """{(prompt_id, model_key, sample_idx): {field: value}} using the latest row per field.
+    Cleared labels (NULL) are left out."""
+    out: dict = {}
+    for prompt_id, model_key, idx, field, value in db.execute(
+            "SELECT l.prompt_id, l.model_key, l.sample_idx, l.field, l.value FROM labels l "
+            "JOIN (SELECT MAX(id) AS id FROM labels WHERE run_id=? "
+            "      GROUP BY prompt_id, model_key, sample_idx, field) last ON l.id = last.id",
+            (run_id,)):
+        if value is not None:
+            out.setdefault((prompt_id, model_key, idx), {})[field] = value
+    return out
+
+
+def label_history(db: sqlite3.Connection, run_id: str, prompt_id: str, model_key: str,
+                  sample_idx: int) -> list[dict]:
+    return [{"field": f, "value": v, "source": src, "at": at} for f, v, src, at in db.execute(
+        "SELECT field, value, source, created_at FROM labels WHERE run_id=? AND prompt_id=? "
+        "AND model_key=? AND sample_idx=? ORDER BY id", (run_id, prompt_id, model_key, sample_idx))]
+
+
+def merge_control_labels(db_labels: dict, csv_labels: dict) -> dict:
+    """Combine human_control_correct from the database and from a --labels CSV. A key present
+    in both with DIFFERENT values is an error (never silently pick one)."""
+    conflicts = sorted(k for k in csv_labels if k in db_labels and csv_labels[k] != db_labels[k])
+    if conflicts:
+        shown = ", ".join(f"{p}/{m}#{i}" for p, m, i in conflicts[:8])
+        raise ValueError(f"{len(conflicts)} label(s) differ between the database and the CSV: "
+                         f"{shown}{' ...' if len(conflicts) > 8 else ''}. Fix one of them "
+                         f"(or import the CSV with import-labels) and score again.")
+    return {**db_labels, **csv_labels}
+
+
 def cmd_score(args: argparse.Namespace) -> int:
     """
     v3 reliability gate + evasion report, per model.
 
       * Control pass rate vs the PRE-REGISTERED control_pass_threshold (read-only).
-        A/B controls are scored exactly by the parser. direct_question controls use a
-        provisional substring hint unless --labels supplies human_control_correct, so the
-        verdict is marked PROVISIONAL until every direct_question control has a human label.
+        A/B controls are scored exactly by the parser. direct_question controls use the
+        human_control_correct label (web UI "ติดป้าย" / import-labels, stored in the labels
+        table; an optional --labels CSV is merged in and must not contradict it), otherwise a
+        provisional substring hint, so the verdict is PROVISIONAL until every direct_question
+        control has a human label.
       * Evasion rate per group_dimension (config: evasive_response_action = log_separately).
       * Position-A rate on bias items: a crude position-bias signal (AB/BA pairs balance it
         in the analysis, but a model that picks A 90% of the time is worth knowing about).
@@ -1023,9 +1155,15 @@ def cmd_score(args: argparse.Namespace) -> int:
     """
     thresholds = load_thresholds(Path(args.thresholds))
     threshold = float(thresholds["control_pass_threshold"])
-    human = load_human_control_labels(Path(args.labels)) if args.labels else {}
+    csv_human = load_human_control_labels(Path(args.labels)) if args.labels else {}
 
     db = open_db(resolve_db(args))
+    db_human = {k: v["human_control_correct"] == "y" for k, v in current_labels(db, args.run_id).items()
+                if v.get("human_control_correct") in ("y", "n")}
+    try:
+        human = merge_control_labels(db_human, csv_human)
+    except ValueError as exc:
+        sys.exit(str(exc))
     rows = db.execute(
         "SELECT prompt_id, model_key, sample_idx, status, response_text, prompt_json "
         "FROM generations WHERE run_id=? ORDER BY model_key, prompt_id, sample_idx",
@@ -1076,7 +1214,9 @@ def cmd_score(args: argparse.Namespace) -> int:
         sys.exit("No v3 items in this run (score only applies to v3 prompt files).")
 
     print(f"Run '{args.run_id}' — v3 score (EXPLORATORY; 95% Wilson CI in brackets)")
-    print(f"Pre-registered control_pass_threshold = {threshold:.2f} (from {args.thresholds}, not editable here)\n")
+    print(f"Pre-registered control_pass_threshold = {threshold:.2f} (from {args.thresholds}, not editable here)")
+    print(f"Human control labels used: {len(db_human)} from the database"
+          f"{f', {len(csv_human)} from {args.labels}' if args.labels else ''}\n")
     exit_code = 0
     for model_key, s in stats.items():
         n, k = s["ctrl_n"], s["ctrl_ok"]
@@ -1089,7 +1229,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         print(f"  controls: {k}/{n} correct = {rate:.2f} [{lo:.2f}, {hi:.2f}] -> {verdict}{tag}")
         if s["ctrl_provisional"]:
             print(f"    {s['ctrl_provisional']} direct_question control(s) scored by substring hint; "
-                  f"label human_control_correct in the CSV and re-run with --labels.")
+                  f"label them in the web UI (ติดป้าย) or `import-labels`, then score again.")
         if s["ctrl_err"]:
             print(f"    {s['ctrl_err']} control call(s) errored and are missing — re-run to complete.")
         if s["ctrl_failed_ids"]:
@@ -1184,6 +1324,7 @@ def cmd_export_csv(args: argparse.Namespace) -> int:
         "ORDER BY prompt_id, model_key, sample_idx", (args.run_id,)).fetchall()
     if not rows:
         sys.exit(f"No data for run '{args.run_id}'")
+    labels = current_labels(db, args.run_id)   # human columns come from the labels table
     # utf-8-sig adds a BOM so Excel / Numbers open Thai text correctly
     with open(args.out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -1191,13 +1332,65 @@ def cmd_export_csv(args: argparse.Namespace) -> int:
         for run_id, prompt_id, model_key, model_id, idx, status, lat, text, pj, seed in rows:
             prompt = json.loads(pj)
             analysed = analyse_generation(prompt, status, text)
+            lab = labels.get((prompt_id, model_key, idx), {})
             v2_part = [run_id, prompt_id, model_key, model_id, idx, seed, status, lat,
                        prompt["text"], text or "",
-                       "y" if refusal_hint(text) else "n", "", ""]
+                       "y" if refusal_hint(text) else "n",
+                       lab.get("human_refusal_label(y/n)", ""), lab.get("human_notes", "")]
             meta = [_csv_value(prompt.get(c)) for c in CSV_V3_META]
             parsed = [_csv_value(analysed.get(c)) for c in CSV_V3_PARSED]
-            w.writerow(v2_part + meta + parsed + [""] * len(CSV_V3_HUMAN))
+            w.writerow(v2_part + meta + parsed + [lab.get(c, "") for c in CSV_V3_HUMAN])
     print(f"Wrote {len(rows)} rows to {args.out}")
+    return 0
+
+
+def cmd_import_labels(args: argparse.Namespace) -> int:
+    """
+    Import every non-blank human_* cell of a labelled export-csv into the labels table
+    (source 'csv-import'). All rows are validated first; if any cell is invalid nothing is
+    written. Cells equal to the current label are skipped, so importing twice is harmless.
+    Blank cells never clear an existing label.
+    """
+    path = Path(args.source)
+    if not path.exists():
+        sys.exit(f"File not found: {path}")
+    db = open_db(resolve_db(args))
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    other = {r.get("run_id") for r in rows} - {args.run_id}
+    if other:
+        sys.exit(f"{path} contains rows of other run(s): {', '.join(sorted(map(str, other)))}")
+    current = current_labels(db, args.run_id)
+    todo, errors = [], []
+    for n, r in enumerate(rows, start=2):   # line 1 is the header
+        try:
+            key = (r["prompt_id"], r["model_key"], int(r["sample_idx"]))
+        except (KeyError, ValueError):
+            errors.append(f"line {n}: missing prompt_id/model_key/sample_idx")
+            continue
+        for field in LABEL_FIELDS:
+            val = (r.get(field) or "").strip()
+            if not val:
+                continue
+            norm = val if LABEL_FIELDS[field] is None else val.lower()
+            if current.get(key, {}).get(field) == norm:
+                continue
+            todo.append((n, key, field, val))
+    # Validate everything inside one transaction, then commit only if there were no errors.
+    written = 0
+    for n, (p, m, i), field, val in todo:
+        try:
+            write_label(db, args.run_id, p, m, i, field, val, "csv-import", commit=False)
+            written += 1
+        except ValueError as exc:
+            errors.append(f"line {n}: {exc}")
+    if errors:
+        db.rollback()
+        print("\n".join(errors[:20]) + (f"\n... {len(errors) - 20} more" if len(errors) > 20 else ""))
+        sys.exit(f"Nothing imported: {len(errors)} problem(s) in {path}")
+    db.commit()
+    print(f"Imported {written} label(s) from {path} into run '{args.run_id}' "
+          f"({len(rows)} rows read; unchanged cells skipped).")
     return 0
 
 
@@ -1247,6 +1440,47 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         failures += 0 if ok else 1
         print(f"{'OK  ' if ok else 'FAIL'} hint expected={expected!r} text={text[:30]!r} -> {got}")
 
+    # Label store: append-only history, latest value wins, validation, CSV/DB merge.
+    db = open_db(":memory:")
+    ctrl = {"id": "C1", "format": "direct_question", "is_control": True, "expected_answer": "x",
+            "scenario_context": "q", "text": "q"}
+    ab = {"id": "B1", "format": "forced_rank", "is_control": False, "text": "q",
+          "options": [{"id": "A", "text": "a"}, {"id": "B", "text": "b"}]}
+    for pr, st in ((ctrl, "ok"), (ab, "ok"), ({**ctrl, "id": "C2"}, "error")):
+        db.execute("INSERT INTO generations (run_id, prompt_id, model_key, model_id, sample_idx, status, "
+                   "response_text, prompt_json, created_at) VALUES ('r','%s','m','m',0,?,?,?,'t')" % pr["id"],
+                   (st, "เลือก: A" if pr is ab else "x", json.dumps(pr)))
+    label_cases = []
+    write_label(db, "r", "C1", "m", 0, "human_control_correct", "Y", "web")
+    write_label(db, "r", "C1", "m", 0, "human_control_correct", "n", "web")
+    write_label(db, "r", "C1", "m", 0, "human_control_correct", "n", "web")   # no-op
+    label_cases.append(("latest value wins", current_labels(db, "r")[("C1", "m", 0)]["human_control_correct"] == "n"))
+    label_cases.append(("history kept, no-op skipped", len(label_history(db, "r", "C1", "m", 0)) == 2))
+    for desc, call in [
+        ("bad value", lambda: write_label(db, "r", "C1", "m", 0, "human_control_correct", "maybe", "web")),
+        ("unknown field", lambda: write_label(db, "r", "C1", "m", 0, "human_mood", "y", "web")),
+        ("missing generation", lambda: write_label(db, "r", "C9", "m", 0, "human_control_correct", "y", "web")),
+        ("failed call", lambda: write_label(db, "r", "C2", "m", 0, "human_control_correct", "y", "web")),
+        ("field not applicable", lambda: write_label(db, "r", "B1", "m", 0, "human_control_correct", "y", "web")),
+    ]:
+        try:
+            call()
+            label_cases.append((f"rejects {desc}", False))
+        except ValueError:
+            label_cases.append((f"rejects {desc}", True))
+    write_label(db, "r", "C1", "m", 0, "human_control_correct", None, "web")
+    label_cases.append(("clear removes current", ("C1", "m", 0) not in current_labels(db, "r")))
+    k = ("C1", "m", 0)
+    label_cases.append(("merge agrees", merge_control_labels({k: True}, {k: True}) == {k: True}))
+    try:
+        merge_control_labels({k: True}, {k: False})
+        label_cases.append(("merge conflict raises", False))
+    except ValueError:
+        label_cases.append(("merge conflict raises", True))
+    for desc, ok in label_cases:
+        failures += 0 if ok else 1
+        print(f"{'OK  ' if ok else 'FAIL'} labels: {desc}")
+
     print(f"\n{failures} failure(s)")
     return 1 if failures else 0
 
@@ -1294,7 +1528,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc = sub.add_parser("score", help="v3: control pass rate vs pre-registered threshold, evasion rate")
     common(sc)
     sc.add_argument("--thresholds", default=DEFAULT_THRESHOLDS)
-    sc.add_argument("--labels", help="labelled export-csv; its human_control_correct overrides hints")
+    sc.add_argument("--labels", help="optional labelled export-csv, merged with the database labels "
+                                     "(a contradicting value is an error)")
     sc.set_defaults(func=cmd_score)
 
     sh = sub.add_parser("show", help="print prompts and responses for eyeballing")
@@ -1307,6 +1542,11 @@ def build_parser() -> argparse.ArgumentParser:
     common(e)
     e.add_argument("--out", required=True)
     e.set_defaults(func=cmd_export_csv)
+
+    il = sub.add_parser("import-labels", help="import human_* columns of a labelled CSV into the database")
+    common(il)
+    il.add_argument("--from", dest="source", required=True, help="labelled export-csv file")
+    il.set_defaults(func=cmd_import_labels)
 
     st = sub.add_parser("selftest", help="run parser regression cases (no model needed)")
     st.set_defaults(func=cmd_selftest)

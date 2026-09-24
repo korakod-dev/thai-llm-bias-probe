@@ -6,6 +6,9 @@ What it does:
   * RUN view: pick any of the configured models, build a spike.py command from a form, run it
     as a subprocess and stream its output. One job at a time; a Stop button terminates it.
     Shows an estimated cost before a paid run. Lists existing runs and label CSVs.
+  * LABEL view ("ติดป้าย"): judge each direct_question control answer right/wrong in the
+    browser (question, expected answer and the full response side by side; blind by default).
+    Labels go to the append-only labels table via spike.write_label(); `score` uses them.
   * MODELS view: browse the public OpenRouter catalog (no key needed), pick ANY model, choose
     which upstream provider / quantization to pin, and add it to config/models.yaml. Models
     added here can be removed here again; the two core entries are never touched.
@@ -38,6 +41,7 @@ Standard library only (plus pyyaml and spike.py, which are already needed).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -630,6 +634,115 @@ def state() -> dict:
 
 
 # ----------------------------------------------------------------------------------------
+# Human labelling ("ติดป้าย"): reads/writes the labels table through spike.py's functions
+# ----------------------------------------------------------------------------------------
+LABEL_TASKS = {"control": "human_control_correct"}   # task name -> rubric column it records
+
+
+def _open_label_db(kind: str) -> sqlite3.Connection:
+    if kind not in DBS:
+        raise BadRequest("db ต้องเป็น real หรือ dry")
+    if not DBS[kind].exists():
+        raise BadRequest("ยังไม่มีไฟล์ฐานข้อมูลนี้")
+    db = spike.open_db(str(DBS[kind]))   # creates the labels table on first use
+    db.execute("PRAGMA busy_timeout = 10000")   # a spike.py run may be writing at the same time
+    return db
+
+
+def _blind_order(run_id: str, gen_id: int) -> str:
+    """Fixed pseudo-random order per run, so both models' answers are interleaved (blind mode)
+    and the order is the same every time the page is opened."""
+    return hashlib.sha256(f"{run_id}:{gen_id}".encode()).hexdigest()
+
+
+def label_items(kind: str, run_id: str, task: str) -> dict:
+    if not RUN_ID_RE.match(run_id or ""):
+        raise BadRequest("run id ไม่ถูกรูปแบบ")
+    field = LABEL_TASKS.get(task)
+    if field is None:
+        raise BadRequest("ไม่รู้จักงานติดป้ายนี้")
+    db = _open_label_db(kind)
+    try:
+        current = spike.current_labels(db, run_id)
+        counts = {(p, m, i): n for p, m, i, n in db.execute(
+            "SELECT prompt_id, model_key, sample_idx, COUNT(*) FROM labels WHERE run_id=? "
+            "GROUP BY prompt_id, model_key, sample_idx", (run_id,))}
+        rows = db.execute(
+            "SELECT id, prompt_id, model_key, sample_idx, status, response_text, prompt_json "
+            "FROM generations WHERE run_id=?", (run_id,)).fetchall()
+    finally:
+        db.close()
+    items = []
+    for gid, prompt_id, model_key, idx, status, text, pj in rows:
+        if status != "ok":
+            continue
+        prompt = json.loads(pj)
+        analysed = spike.analyse_generation(prompt, status, text)
+        if not spike.label_applies(field, prompt, analysed):
+            continue
+        lab = current.get((prompt_id, model_key, idx), {})
+        items.append({
+            "gen_id": gid, "prompt_id": prompt_id, "model_key": model_key, "sample_idx": idx,
+            "question": prompt.get("text", ""), "expected": prompt.get("expected_answer"),
+            "response": text or "", "hint": analysed.get("control_auto_correct"),
+            "label": lab.get(field), "note": lab.get("human_notes", ""),
+            "n_history": counts.get((prompt_id, model_key, idx), 0),
+            "_order": _blind_order(run_id, gid),
+        })
+    items.sort(key=lambda x: x.pop("_order"))
+    return {"run_id": run_id, "db": kind, "field": field, "items": items}
+
+
+def _generation_key(db: sqlite3.Connection, run_id: str, gen_id: Any) -> tuple:
+    try:
+        gid = int(gen_id)
+    except (TypeError, ValueError):
+        raise BadRequest("gen_id ไม่ถูกต้อง")
+    row = db.execute("SELECT prompt_id, model_key, sample_idx FROM generations WHERE id=? AND run_id=?",
+                     (gid, run_id)).fetchone()
+    if row is None:
+        raise BadRequest("ไม่พบคำตอบนี้ใน run ที่เลือก")
+    return row
+
+
+def set_label(req: dict) -> dict:
+    run_id = str(req.get("run_id", ""))
+    if not RUN_ID_RE.match(run_id):
+        raise BadRequest("run id ไม่ถูกรูปแบบ")
+    field = str(req.get("field", ""))
+    if field not in set(LABEL_TASKS.values()) | {"human_notes"}:
+        raise BadRequest("ไม่รับป้ายชนิดนี้จากหน้าเว็บ")
+    value = req.get("value")
+    if value is not None and not isinstance(value, str):
+        raise BadRequest("ค่าป้ายต้องเป็นข้อความ")
+    if isinstance(value, str) and len(value) > 2000:
+        raise BadRequest("บันทึกยาวเกิน 2000 ตัวอักษร")
+    db = _open_label_db(str(req.get("db", "")))
+    try:
+        p, m, i = _generation_key(db, run_id, req.get("gen_id"))
+        try:
+            current = spike.write_label(db, run_id, p, m, i, field, value, "web")
+        except ValueError as exc:   # spike's validation: allowed values, applies_to, failed call
+            raise BadRequest(str(exc))
+        n = db.execute("SELECT COUNT(*) FROM labels WHERE run_id=? AND prompt_id=? AND model_key=? "
+                       "AND sample_idx=?", (run_id, p, m, i)).fetchone()[0]
+    finally:
+        db.close()
+    return {"value": current, "n_history": n}
+
+
+def get_history(kind: str, run_id: str, gen_id: str) -> list:
+    if not RUN_ID_RE.match(run_id or ""):
+        raise BadRequest("run id ไม่ถูกรูปแบบ")
+    db = _open_label_db(kind)
+    try:
+        p, m, i = _generation_key(db, run_id, gen_id)
+        return spike.label_history(db, run_id, p, m, i)
+    finally:
+        db.close()
+
+
+# ----------------------------------------------------------------------------------------
 # Form -> spike.py argv (validated)
 # ----------------------------------------------------------------------------------------
 def _run_id(req: dict) -> str:
@@ -827,6 +940,15 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/job":
             since = int(one("since", "0") or 0)
             return self._json(JOB.snapshot(max(0, since)))
+        if url.path in ("/api/label/items", "/api/label/history"):
+            if not self._token_ok():
+                return self._json({"error": "token ไม่ถูกต้อง (รีเฟรชหน้าเว็บ)"}, 403)
+            try:
+                if url.path == "/api/label/items":
+                    return self._json(label_items(one("db"), one("run_id"), one("task", "control")))
+                return self._json(get_history(one("db"), one("run_id"), one("gen_id")))
+            except BadRequest as exc:
+                return self._json({"error": str(exc)}, 400)
         if url.path in ("/api/catalog", "/api/endpoints"):
             # These make outbound requests, so they need the token like a POST does.
             if not self._token_ok():
@@ -875,6 +997,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(estimate(req))
             if path == "/api/models/add":
                 return self._json(add_model(req))
+            if path == "/api/label/set":
+                return self._json(set_label(req))
             if path == "/api/models/remove":
                 remove_model(str(req.get("key", "")))
                 return self._json({"ok": True})
@@ -969,6 +1093,19 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
 .filters { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
 .filters .check { margin: 0; }
 .filters select { width: auto; }
+.lbar { display: grid; gap: 12px; grid-template-columns: 1fr; }
+@media (min-width: 760px) { .lbar { grid-template-columns: 1.4fr 1fr 1.3fr; } }
+.progress { height: 6px; background: var(--line); border-radius: 99px; margin-top: 14px; overflow: hidden; }
+.progress div { height: 100%; width: 0; background: var(--ok); transition: width .2s; }
+.qa { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
+.qa.expected { border-color: var(--ok); }
+.qlabel { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.qtext { white-space: pre-wrap; word-break: break-word; font-size: 14.5px; }
+.qtext.resp { max-height: 420px; overflow: auto; }
+.okbtn { background: var(--ok); color: #fff; }
+.badbtn { background: var(--bad); color: #fff; }
+.kbd { display: inline-block; font: 11px ui-monospace, Menlo, monospace; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; opacity: .8; }
+textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--ink); font: inherit; resize: vertical; }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -979,6 +1116,7 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
 
   <div class="nav" id="nav">
     <button data-view="run" class="on">รันทดสอบ</button>
+    <button data-view="label" class="ghost">ติดป้าย</button>
     <button data-view="models" class="ghost">เลือกโมเดล</button>
   </div>
 
@@ -1031,7 +1169,7 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
             <input type="number" id="repeats" min="2" max="5" value="2">
           </div>
           <div data-for="score">
-            <label for="labels">ไฟล์ label ที่ติดป้ายแล้ว <span class="muted">(ไม่บังคับ)</span></label>
+            <label for="labels">ไฟล์ label CSV เพิ่มเติม <span class="muted">(ไม่บังคับ — ป้ายจากแท็บติดป้ายใช้อัตโนมัติ)</span></label>
             <select id="labels"></select>
           </div>
           <div data-for="run score summary show export-csv">
@@ -1071,6 +1209,51 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
         <div id="csvs" class="hint"></div>
       </section>
     </div>
+  </div>
+
+  <!-- ============================ LABEL VIEW ============================ -->
+  <div id="view_label" hidden>
+    <section class="card">
+      <div class="lbar">
+        <div><label for="l_run">Run</label><select id="l_run"></select></div>
+        <div><label for="l_mode">แสดง</label>
+          <select id="l_mode"><option value="todo">ข้อที่ยังไม่ติดป้ายก่อน</option><option value="all">ทุกข้อตามลำดับ</option></select></div>
+        <div class="check" style="margin-top:26px"><input type="checkbox" id="l_blind" checked><label for="l_blind">โหมดปิดตา (ซ่อนชื่อโมเดลและคำใบ้)</label></div>
+      </div>
+      <div class="progress"><div id="l_bar"></div></div>
+      <p class="hint" id="l_info">เลือก run เพื่อเริ่ม ติดป้ายเฉพาะข้อสอบควบคุมแบบถามตรง (ข้อ A/B ระบบตรวจเองได้)</p>
+    </section>
+
+    <section class="card" id="l_card" hidden style="margin-top:16px">
+      <div class="row between" style="margin-top:0">
+        <b id="l_pos"></b>
+        <span id="l_who" class="muted"></span>
+      </div>
+      <div class="qa"><div class="qlabel">คำถามที่ส่งให้โมเดล</div><div id="l_q" class="qtext"></div></div>
+      <div class="qa expected"><div class="qlabel">เฉลย (expected_answer)</div><div id="l_exp" class="qtext"></div></div>
+      <div class="qa"><div class="qlabel">คำตอบของโมเดล (เต็ม)</div><div id="l_resp" class="qtext resp"></div></div>
+      <div class="row">
+        <button class="okbtn" id="l_y">✓ ถูก <span class="kbd">Y</span></button>
+        <button class="badbtn" id="l_n">✗ ผิด <span class="kbd">N</span></button>
+        <button class="ghost" id="l_prev">← ก่อนหน้า</button>
+        <button class="ghost" id="l_next">ข้าม →</button>
+        <span id="l_cur" class="pill muted">ยังไม่ติดป้าย</span>
+        <button class="ghost small" id="l_clear" hidden>ล้างป้าย</button>
+      </div>
+      <label for="l_note">บันทึก (ไม่บังคับ — บันทึกอัตโนมัติเมื่อออกจากช่อง)</label>
+      <textarea id="l_note" rows="2" placeholder="เช่น ตอบถูก แต่แต่งรายละเอียดผิด"></textarea>
+      <div class="row">
+        <button class="ghost small" id="l_hist_btn">ดูประวัติป้ายของข้อนี้</button>
+        <span class="hint" id="l_msg"></span>
+      </div>
+      <div id="l_hist" class="hint" hidden></div>
+    </section>
+
+    <section class="card" id="l_done" hidden style="margin-top:16px">
+      <b>ติดป้ายครบทุกข้อแล้ว</b>
+      <p class="hint">score จะใช้ป้ายเหล่านี้อัตโนมัติ ไม่ต้องเลือกไฟล์ CSV</p>
+      <div class="row"><button id="l_score">Score ด้วยป้ายนี้</button><button class="ghost" id="l_review">ทบทวนทุกข้ออีกครั้ง</button></div>
+    </section>
   </div>
 
   <!-- ============================ MODELS VIEW ============================ -->
@@ -1117,6 +1300,9 @@ let polling = null;
 const SEL = new Set();        // model keys ticked in the run form (kept across refreshes)
 let CAT = {loaded: false, scope: "featured"};    // catalog view state (scope: featured | all | v:<slug>)
 let D = null;                 // model shown in the detail panel: {id, name, endpoints}
+let VIEW = "run";
+let L = null;                 // label view: {db, run_id, field, items, i}
+let LSEEN = new Set();        // blind mode: items whose model name the user chose to reveal
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1141,6 +1327,9 @@ async function api(path, body) {
 function setView(v) {
   $("view_run").hidden = v !== "run";
   $("view_models").hidden = v !== "models";
+  $("view_label").hidden = v !== "label";
+  VIEW = v;
+  if (v === "label") fillLabelRuns();
   document.querySelectorAll("#nav button").forEach(b => b.className = b.dataset.view === v ? "" : "ghost");
   if (v === "models" && !CAT.loaded) loadCatalog();
 }
@@ -1181,7 +1370,7 @@ function renderState() {
   $("model_one").innerHTML = S.models.map(m => `<option>${esc(m.key)}</option>`).join("");
   if (cmd === "show") $("model_one").insertAdjacentHTML("afterbegin", `<option value="">(ทุกโมเดล)</option>`);
   if (mv) $("model_one").value = mv;
-  $("labels").innerHTML = `<option value="">(ไม่ใช้ ใช้ hint อัตโนมัติ)</option>` +
+  $("labels").innerHTML = `<option value="">(ไม่ใช้ — ใช้ป้ายในฐานข้อมูล)</option>` +
     S.label_csvs.map(f => `<option>${esc(f)}</option>`).join("");
   if (lv) $("labels").value = lv;
 
@@ -1193,9 +1382,10 @@ function renderState() {
     return `<tr><td><b>${esc(r.run_id)}</b><br><span class="muted">${esc((r.created_at||"").slice(0,16).replace("T"," "))}</span></td>
       <td>${r.db === "dry" ? '<span class="pill warn">dry</span>' : '<span class="pill ok">จริง</span>'}</td>
       <td>${models || '<span class="muted">-</span>'}</td>
-      <td class="actions">${b("score","Score")} ${b("summary","Summary")} ${b("export-csv","CSV")}</td></tr>`;
+      <td class="actions">${b("score","Score")} ${b("summary","Summary")} ${b("export-csv","CSV")} <button class="ghost" data-label="${r.db}|${esc(r.run_id)}">ติดป้าย</button></td></tr>`;
   }).join("") : `<tr><td colspan="4" class="muted">ยังไม่มี run</td></tr>`;
 
+  if (VIEW === "label") fillLabelRuns();
   $("csvs").innerHTML = S.label_csvs.length
     ? "ดาวน์โหลด CSV: " + S.label_csvs.map(f => `<a href="/download?file=${encodeURIComponent(f)}">${esc(f)}</a>`).join(" · ")
     : "";
@@ -1230,7 +1420,7 @@ function updateHint() {
   } else if (cmd === "export-csv") {
     t = "ไฟล์จะถูกบันทึกเป็น v3-*.csv ในโฟลเดอร์โปรเจกต์ (อยู่ใน .gitignore) แล้วดาวน์โหลดได้จากด้านขวา";
   } else if (cmd === "score") {
-    t = "ถ้ายังไม่ได้เลือกไฟล์ label ผลของข้อสอบควบคุมแบบถามตรงจะเป็นผลชั่วคราว (PROVISIONAL)";
+    t = "ป้ายจากแท็บ \"ติดป้าย\" ถูกใช้อัตโนมัติ ไฟล์ CSV ด้านบนเป็นตัวเลือกเสริม (ถ้าขัดกับป้ายในฐานข้อมูล score จะหยุดและแจ้ง) ข้อที่ยังไม่มีป้ายจะใช้คำใบ้อัตโนมัติ (PROVISIONAL)";
   }
   $("cmd_hint").textContent = t;
 }
@@ -1321,6 +1511,111 @@ async function poll() {
 
 function startPolling() { if (!polling) polling = setInterval(poll, 700); poll(); }
 async function refresh() { S = await api("/api/state"); renderState(); }
+
+/* ------------------------------- label view ------------------------------- */
+function fillLabelRuns() {
+  if (!S) return;
+  const cur = $("l_run").value;
+  $("l_run").innerHTML = `<option value="">— เลือก run —</option>` + S.runs.map(r =>
+    `<option value="${r.db}|${esc(r.run_id)}">${esc(r.run_id)}${r.db === "dry" ? " (dry)" : ""}</option>`).join("");
+  if (cur) $("l_run").value = cur;
+}
+
+async function loadLabels(keepIndex) {
+  const v = $("l_run").value;
+  if (!v) { L = null; $("l_card").hidden = true; $("l_done").hidden = true; return; }
+  const [db, run_id] = [v.slice(0, v.indexOf("|")), v.slice(v.indexOf("|") + 1)];
+  $("l_info").textContent = "กำลังโหลด…";
+  try {
+    const r = await api("/api/label/items?" + new URLSearchParams({db, run_id, task: "control"}));
+    const i = keepIndex && L && L.run_id === run_id ? L.i : 0;
+    L = {db, run_id, field: r.field, items: r.items, i};
+    LSEEN = new Set();
+    if (!L.items.length) {
+      $("l_info").textContent = "run นี้ไม่มีข้อสอบควบคุมแบบถามตรงที่ต้องติดป้าย";
+      $("l_card").hidden = true; $("l_done").hidden = true; updateProgress(); return;
+    }
+    if (!keepIndex && $("l_mode").value === "todo") gotoNext(-1);
+    renderLabel();
+  } catch (e) { $("l_info").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+}
+
+function labelledCount() { return L ? L.items.filter(x => x.label).length : 0; }
+
+function updateProgress() {
+  const n = L ? L.items.length : 0, k = labelledCount();
+  $("l_bar").style.width = n ? (100 * k / n) + "%" : "0";
+  if (L && n) $("l_info").textContent = `ติดป้ายแล้ว ${k}/${n} ข้อ · ${L.db === "dry" ? "ฐานข้อมูล dry run" : "ฐานข้อมูลจริง"} · คีย์ลัด Y = ถูก, N = ผิด, ← → = เลื่อน`;
+}
+
+// Move to the next item after `from` (wrapping); in "todo" mode prefer unlabelled ones.
+function gotoNext(from) {
+  const n = L.items.length;
+  if ($("l_mode").value === "todo") {
+    for (let s = 1; s <= n; s++) { const j = (from + s + n) % n; if (!L.items[j].label) { L.i = j; return true; } }
+    return false;   // everything is labelled
+  }
+  L.i = Math.min(n - 1, from + 1);
+  return true;
+}
+
+function renderLabel() {
+  updateProgress();
+  const it = L.items[L.i];
+  const allDone = labelledCount() === L.items.length;
+  $("l_done").hidden = !allDone;
+  $("l_card").hidden = false;
+  $("l_pos").textContent = `ข้อ ${L.i + 1} / ${L.items.length}  ·  ${it.prompt_id}${it.sample_idx ? " #" + it.sample_idx : ""}`;
+  const blind = $("l_blind").checked;
+  const reveal = !blind || LSEEN.has(it.gen_id);
+  $("l_who").innerHTML = reveal
+    ? `โมเดล: <b>${esc(it.model_key)}</b>${blind ? "" : ` · คำใบ้อัตโนมัติ: ${it.hint === true ? "ถูก" : it.hint === false ? "ผิด" : "-"}`}`
+    : (it.label ? `<button class="ghost small" id="l_reveal">ดูชื่อโมเดล</button>` : `โมเดล: ซ่อนอยู่ (ติดป้ายก่อนถึงดูได้)`);
+  $("l_q").textContent = it.question;
+  $("l_exp").textContent = it.expected ?? "(ไม่มีเฉลย)";
+  $("l_resp").textContent = it.response;
+  $("l_resp").scrollTop = 0;
+  const cur = $("l_cur");
+  cur.className = "pill " + (it.label === "y" ? "ok" : it.label === "n" ? "bad" : "muted");
+  cur.textContent = it.label === "y" ? "ป้ายปัจจุบัน: ถูก" : it.label === "n" ? "ป้ายปัจจุบัน: ผิด" : "ยังไม่ติดป้าย";
+  $("l_clear").hidden = !it.label;
+  $("l_note").value = it.note || "";
+  $("l_hist").hidden = true;
+  $("l_hist_btn").textContent = `ดูประวัติป้ายของข้อนี้ (${it.n_history})`;
+  $("l_prev").disabled = L.i === 0;
+  $("l_msg").textContent = "";
+}
+
+async function saveLabel(value) {
+  const it = L.items[L.i];
+  try {
+    await saveNote();   // keep a note typed just before pressing Y/N
+    const r = await api("/api/label/set", {db: L.db, run_id: L.run_id, gen_id: it.gen_id, field: L.field, value});
+    it.label = r.value; it.n_history = r.n_history;
+    if (value !== null && gotoNext(L.i) === false) L.i = L.items.indexOf(it);   // all done: stay
+    renderLabel();
+  } catch (e) { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+}
+
+async function saveNote() {
+  if (!L) return;
+  const it = L.items[L.i], v = $("l_note").value.trim();
+  if (v === (it.note || "")) return;
+  const r = await api("/api/label/set", {db: L.db, run_id: L.run_id, gen_id: it.gen_id, field: "human_notes", value: v || null});
+  it.note = r.value || ""; it.n_history = r.n_history;
+  $("l_msg").innerHTML = `<span class="ok">บันทึกโน้ตแล้ว</span>`;
+  $("l_hist_btn").textContent = `ดูประวัติป้ายของข้อนี้ (${it.n_history})`;
+}
+
+async function showHistory() {
+  const it = L.items[L.i];
+  try {
+    const h = await api("/api/label/history?" + new URLSearchParams({db: L.db, run_id: L.run_id, gen_id: it.gen_id}));
+    const txt = (f, v) => f === "human_control_correct" ? (v === "y" ? "ถูก" : v === "n" ? "ผิด" : "ล้าง") : (v ? `โน้ต: ${v}` : "ล้างโน้ต");
+    $("l_hist").innerHTML = h.length ? h.map(x => `<div>${esc((x.at || "").replace("T", " ").slice(0, 19))} · ${esc(x.source)} · ${esc(txt(x.field, x.value))}</div>`).join("") : "ยังไม่มีประวัติ";
+    $("l_hist").hidden = false;
+  } catch (e) { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+}
 
 /* ------------------------------- models view ------------------------------- */
 let catTimer = null, catSeq = 0;
@@ -1450,6 +1745,37 @@ async function addModel() {
 
 /* ------------------------------- events ------------------------------- */
 $("nav").addEventListener("click", e => { if (e.target.dataset.view) setView(e.target.dataset.view); });
+$("l_run").addEventListener("change", () => loadLabels(false));
+$("l_mode").addEventListener("change", () => { if (L) { if ($("l_mode").value === "todo") gotoNext(L.i - 1); renderLabel(); } });
+$("l_blind").addEventListener("change", () => { if (L) renderLabel(); });
+$("l_y").addEventListener("click", () => saveLabel("y"));
+$("l_n").addEventListener("click", () => saveLabel("n"));
+$("l_clear").addEventListener("click", () => { if (confirm("ล้างป้ายของข้อนี้? (ประวัติยังเก็บไว้)")) saveLabel(null); });
+$("l_prev").addEventListener("click", async () => { await saveNote().catch(() => {}); if (L.i > 0) { L.i--; renderLabel(); } });
+$("l_next").addEventListener("click", async () => {
+  await saveNote().catch(() => {});
+  const was = L.i;
+  if ($("l_mode").value === "todo") { if (!gotoNext(L.i)) L.i = Math.min(L.items.length - 1, was + 1); }
+  else L.i = Math.min(L.items.length - 1, L.i + 1);
+  renderLabel();
+});
+$("l_note").addEventListener("blur", () => saveNote().catch(e => { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }));
+$("l_hist_btn").addEventListener("click", showHistory);
+$("l_who").addEventListener("click", e => { if (e.target.id === "l_reveal") { LSEEN.add(L.items[L.i].gen_id); renderLabel(); } });
+$("l_review").addEventListener("click", () => { $("l_mode").value = "all"; L.i = 0; renderLabel(); });
+$("l_score").addEventListener("click", () => {
+  setView("run"); setTab("score");
+  submit({command: "score", run_id: L.run_id, dry_run: L.db === "dry"});
+});
+document.addEventListener("keydown", e => {
+  if (VIEW !== "label" || !L || $("l_card").hidden) return;
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "y") { e.preventDefault(); saveLabel("y"); }
+  else if (k === "n") { e.preventDefault(); saveLabel("n"); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); $("l_next").click(); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); $("l_prev").click(); }
+});
 $("go_models").addEventListener("click", () => setView("models"));
 $("tabs").addEventListener("click", e => { if (e.target.dataset.cmd) setTab(e.target.dataset.cmd); });
 $("form").addEventListener("submit", e => { e.preventDefault(); submit(collect()); });
@@ -1458,6 +1784,8 @@ $("model_checks").addEventListener("change", () => { SEL.clear(); selectedKeys()
 $("stop").addEventListener("click", () => api("/api/job/stop", {}).catch(e => alert(e.message)));
 $("refresh").addEventListener("click", refresh);
 $("runs").addEventListener("click", e => {
+  const lb = e.target.closest("button[data-label]");
+  if (lb) { setView("label"); $("l_run").value = lb.dataset.label; loadLabels(false); return; }
   const b = e.target.closest("button[data-quick]"); if (!b) return;
   submit({command: b.dataset.quick, run_id: b.dataset.run, dry_run: b.dataset.dry === "true"});
 });
