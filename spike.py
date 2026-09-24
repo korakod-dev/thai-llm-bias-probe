@@ -47,8 +47,12 @@ Usage:
 
   # 3) Controls first (22 items, cheap), then the full v3 run (174 items; raise --max-calls
   #    for --samples > 1). Paid calls ask for confirmation unless --yes is given.
-  python spike.py run --run-id v3-or-ctrl-001 --prompts controls_only.jsonl
-  python spike.py run --run-id v3-or-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 1200
+  #    Always name the models with --model: without it EVERY model in the config is used,
+  #    and resuming a run later only works with the same model set (it is in config_hash).
+  python spike.py run --run-id v3-or-ctrl-001 --prompts controls_only.jsonl \
+      --model or-qwen35-9b --model or-gemma4-31b
+  python spike.py run --run-id v3-or-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 1200 \
+      --model or-qwen35-9b --model or-gemma4-31b
   python spike.py summary --run-id v3-or-001
   python spike.py score --run-id v3-or-001
   python spike.py show --run-id v3-or-001 --prompt CTRL_fr_license
@@ -478,6 +482,7 @@ def load_prompts(path: Path) -> list[dict]:
 def compute_config_hash(models: list[ModelCfg], prompts: list[dict]) -> str:
     """Hash of everything that changes WHAT is asked or HOW (not rpm/concurrency/timeout/note).
     A run id can only be resumed if this hash matches, so one run = one consistent experiment.
+    Callers pass the models selected for the run (see cmd_run), not the whole config file.
     For v3 the rendered text is inside each prompt dict, so wording changes change the hash."""
     payload = {
         "models": sorted(
@@ -806,13 +811,26 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not active:
         sys.exit("No runnable models (missing API keys?). Use --dry-run to test the plumbing.")
 
-    config_hash = compute_config_hash(models, prompts)
+    # Hash only the models selected for THIS run: the web UI lets you add models to the
+    # config file, and that must not make older runs un-resumable. (For a run that used every
+    # model in the file, e.g. v3-or-ctrl-001, the value is identical to the old all-models hash.)
+    config_hash = compute_config_hash([m for m in models if m.key in wanted], prompts)
     db = open_db(resolve_db(args))
 
     row = db.execute("SELECT config_hash FROM runs WHERE run_id=?", (args.run_id,)).fetchone()
     if row and row[0] != config_hash and not args.force:
-        sys.exit(f"Run '{args.run_id}' already exists with a DIFFERENT models/prompts configuration.\n"
-                 f"Use a new --run-id (recommended: one run = one consistent experiment), "
+        # The hash covers only the models selected for the run, so the usual cause is a
+        # different model set (e.g. no --model after adding models to the config). Say which.
+        used = sorted(r[0] for r in db.execute(
+            "SELECT DISTINCT model_key FROM generations WHERE run_id=?", (args.run_id,)))
+        hint = ""
+        if used and set(used) != wanted:
+            hint = ("\nThis run used: " + ", ".join(used) + "; this command selected: "
+                    + ", ".join(sorted(wanted)) + ".\nTo resume it, select the same models: "
+                    + " ".join(f"--model {k}" for k in used))
+        sys.exit(f"Run '{args.run_id}' already exists with a DIFFERENT models/prompts configuration."
+                 f"{hint}\n"
+                 f"Otherwise use a new --run-id (recommended: one run = one consistent experiment), "
                  f"or pass --force to override.")
     if not row:
         db.execute("INSERT INTO runs (run_id, created_at, config_hash, n_samples) VALUES (?,?,?,?)",
