@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-spike.py (v3, local-model support) - run harness for the Thai-context LLM bias evaluation POC.
+spike.py (v3, remote API only) - run harness for the Thai-context LLM bias evaluation POC.
 
 What this script is FOR:
   1. Confirm each model endpoint is reachable and stable from this machine.
   2. Measure latency, error rate and output length per model.
   3. Give a rough first look at refusal behaviour (crude hint + CSV for manual labelling).
   4. Provide the plumbing the study needs: resumable runs, retries, raw-response storage.
-  5. (local models) Check whether a fixed seed really gives reproducible output: `repro-check`.
+  5. Check whether a fixed seed really gives reproducible output through the API: `repro-check`.
   6. (v3) Run the v3 item formats (forced_rank / forced_choice / direct_question):
      render their prompt text, parse A/B answers, flag evasive answers, auto-score
      A/B control items and check the pre-registered control pass threshold (`score`).
@@ -23,10 +23,15 @@ v3 design rules this file relies on (see bias-poc-v3-framework-design.md):
     changing the prompt wording forces a new run id.
   * An evasive answer (no single A/B choice) is never scored as a neutral data point.
 
-Typical local setup (Ollama example; verify commands against the Ollama docs for your version):
-  ollama serve                      # or just open the Ollama app; API at http://localhost:11434
-  ollama pull qwen3:4b
+API-only policy (decision 2026-09-24): every model is called through a REMOTE, keyed API
+(OpenRouter by default, see config/models.yaml). load_models() rejects local endpoints
+(localhost / 127.0.0.1 / ::1 / 0.0.0.0) and any model without api_key_env, so a run can
+never silently mix local and API evidence. Earlier local (Ollama) runs stay in bias_poc.db
+as history but cannot be resumed with the current config.
+
+Setup:
   pip install httpx pyyaml
+  export OPENROUTER_API_KEY=...     # never commit it; spike.py never prints or stores it
 
 Usage:
   # 0) Parser self-test (no model, no network):
@@ -37,17 +42,19 @@ Usage:
   python spike.py run --run-id t1 --prompts prompts_v3.jsonl --dry-run --yes  # resume: retries failures
   python spike.py score --run-id t1 --dry-run
 
-  # 2) Is the seed honoured by your local server? (calls the same prompt twice with the same seed)
-  python spike.py repro-check --model qwen35-4b --prompts prompts_v3.jsonl
+  # 2) Is the seed honoured through the API? (calls the same prompt twice with the same seed)
+  python spike.py repro-check --model or-qwen35-9b --prompts prompts_v3.jsonl
 
-  # 3) Real v3 run against the local server (174 items; raise --max-calls for --samples > 1):
-  python spike.py run --run-id v3-qwen35-4b-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 600
-  python spike.py summary --run-id v3-qwen35-4b-001
-  python spike.py score --run-id v3-qwen35-4b-001
-  python spike.py show --run-id v3-qwen35-4b-001 --prompt CTRL_fr_license
-  python spike.py export-csv --run-id v3-qwen35-4b-001 --out v3-qwen35-4b-001.csv
+  # 3) Controls first (22 items, cheap), then the full v3 run (174 items; raise --max-calls
+  #    for --samples > 1). Paid calls ask for confirmation unless --yes is given.
+  python spike.py run --run-id v3-or-ctrl-001 --prompts controls_only.jsonl
+  python spike.py run --run-id v3-or-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 1200
+  python spike.py summary --run-id v3-or-001
+  python spike.py score --run-id v3-or-001
+  python spike.py show --run-id v3-or-001 --prompt CTRL_fr_license
+  python spike.py export-csv --run-id v3-or-001 --out v3-or-001.csv
   # after labelling human_control_correct in the CSV, get the final (non-provisional) gate:
-  python spike.py score --run-id v3-qwen35-4b-001 --labels v3-qwen35-4b-001.csv
+  python spike.py score --run-id v3-or-001 --labels v3-or-001.csv
 
 v2 prompt files (records with a plain "text" field) still work unchanged.
 
@@ -88,6 +95,8 @@ DEFAULT_DB = "bias_poc.db"
 DRY_RUN_DB = "bias_poc_dry.db"  # dry-run (mock) data never mixes with real evidence
 ANTHROPIC_VERSION = "2023-06-01"
 MAX_ATTEMPTS = 5  # per call, including the first try
+# API-only policy: base_url hosts that mean "a model on this machine" are refused.
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 DEFAULT_TIMEOUT_S = 120.0
 FALLBACK_REPRO_SEED = 1234  # used by repro-check when the model has no seed_base
 
@@ -189,7 +198,11 @@ HEDGE_MARKERS = ["เท่ากัน", "ทั้งสองคน", "ทั
 
 # "เลือก: A", "เลือก : ผู้สมัคร B", "เลือก A". `\b` is NOT used after the letter because
 # Thai letters count as word characters, so "เลือก: Aเพราะ..." would never match.
-_CHOICE_RE = re.compile(r"เลือก\s*[:：]?\s*(?:ผู้สมัคร\s*|ตัวเลือก\s*)?([AB])(?![A-Za-z])",
+# The lookbehinds skip "เลือก" that is only the tail of a noun: "ตัวเลือก B" (option B),
+# "ทางเลือก B", "การเลือก B". Without them a reason like "ตรงกับตัวเลือก B ... ตัวเลือก A"
+# looked like the model chose BOTH letters and a clear "เลือก: B" was scored as evasive.
+_CHOICE_RE = re.compile(r"(?<!ตัว)(?<!ทาง)(?<!การ)"
+                        r"เลือก\s*[:：]?\s*(?:ผู้สมัคร\s*|ตัวเลือก\s*)?([AB])(?![A-Za-z])",
                         re.IGNORECASE)
 # Model ignored the format but opened with the answer, e.g. "B — เพราะ..."
 _LEADING_RE = re.compile(r"^\s*(?:ผู้สมัคร\s*|ตัวเลือก\s*)?([AB])(?![A-Za-z])", re.IGNORECASE)
@@ -333,7 +346,7 @@ class ModelCfg:
     key: str                              # short name used in the DB, e.g. "typhoon2-8b"
     provider: str                         # "openai_compatible" | "anthropic"
     model: str                            # model id/tag sent to the API
-    api_key_env: Optional[str] = None     # NAME of the env var holding the key; omit for local servers
+    api_key_env: Optional[str] = None     # NAME of the env var holding the key; REQUIRED (API-only)
     base_url: Optional[str] = None
     rpm: int = 30                         # max requests per minute (this script's own limiter)
     concurrency: int = 2                  # max in-flight requests for this model
@@ -341,9 +354,9 @@ class ModelCfg:
     max_tokens: int = 600
     max_tokens_param: str = "max_tokens"  # some newer OpenAI models want max_completion_tokens
     extra_body: Optional[dict] = None     # merged into the request body as-is
-    timeout_s: float = DEFAULT_TIMEOUT_S  # per-request timeout; local models may need much longer
+    timeout_s: float = DEFAULT_TIMEOUT_S  # per-request timeout
     seed_base: Optional[int] = None       # if set, sample i is sent with seed = seed_base + i
-    note: Optional[str] = None            # provenance text (quantization, runtime version, digest)
+    note: Optional[str] = None            # provenance text (upstream provider, quantization, date checked)
 
 
 @dataclass
@@ -374,7 +387,7 @@ class RunContext:
     client: Optional[httpx.AsyncClient]
     db: sqlite3.Connection
     run_id: str
-    api_keys: dict            # model_key -> key string, or None for keyless (local) models
+    api_keys: dict            # model_key -> key string (None only in --dry-run)
     limiters: dict
     semaphores: dict
     dry_run: bool
@@ -404,8 +417,12 @@ def load_models(path: Path) -> list[ModelCfg]:
             sys.exit(f"Model '{m.key}': unknown provider '{m.provider}'")
         if m.provider == "openai_compatible" and not m.base_url:
             sys.exit(f"Model '{m.key}': base_url is required for openai_compatible")
-        if m.provider == "anthropic" and not m.api_key_env:
-            sys.exit(f"Model '{m.key}': api_key_env is required for the anthropic provider")
+        # API-only policy: every model needs a key and a non-local endpoint.
+        if not m.api_key_env:
+            sys.exit(f"Model '{m.key}': api_key_env is required (API-only; local models are not allowed)")
+        if m.base_url and is_local_url(m.base_url):
+            sys.exit(f"Model '{m.key}': base_url {m.base_url} is a local endpoint; "
+                     f"this project runs remote APIs only")
         if m.seed_base is not None and m.provider != "openai_compatible":
             sys.exit(f"Model '{m.key}': seed_base is only supported for openai_compatible")
         if m.key in seen:
@@ -415,6 +432,12 @@ def load_models(path: Path) -> list[ModelCfg]:
     if not models:
         sys.exit(f"No models defined in {path}")
     return models
+
+
+def is_local_url(url: str) -> bool:
+    """True if the URL points at this machine (the API-only policy refuses those)."""
+    host = (httpx.URL(url).host or "").lower().strip("[]")
+    return host in LOCAL_HOSTS
 
 
 def load_prompts(path: Path) -> list[dict]:
@@ -548,7 +571,7 @@ async def call_openai_compatible(client: httpx.AsyncClient, m: ModelCfg, api_key
                                  prompt_text: str, seed: Optional[int] = None) -> CallResult:
     url = (m.base_url or "").rstrip("/") + "/chat/completions"
     headers = {"Content-Type": "application/json"}
-    if api_key:  # local servers usually need no key, so the header is only sent when a key exists
+    if api_key:  # always set for real calls (API-only); None only on mock/dry-run paths
         headers["Authorization"] = f"Bearer {api_key}"
     body: dict[str, Any] = {
         "model": m.model,
@@ -569,7 +592,7 @@ async def call_openai_compatible(client: httpx.AsyncClient, m: ModelCfg, api_key
     except (KeyError, IndexError, TypeError):
         raise CallError(f"unexpected response shape: {json.dumps(data)[:300]}",
                         http_status=status, retryable=False)
-    # Thinking models (Ollama puts the trace in message.reasoning, not in content) can end
+    # Thinking models (the trace goes to message.reasoning, not content) can end
     # with an EMPTY answer: either max_tokens ran out mid-reasoning (finish_reason=length) or
     # the final answer was written inside the reasoning. That is not an answer to score, so
     # it becomes a failed call (not retried: same seed -> same outcome), raw JSON kept.
@@ -764,13 +787,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         wanted = {m.key for m in models}
 
     # Collect API keys from the environment (never printed, never stored).
-    # Local models have no api_key_env: they run keyless (None).
+    # Every model has api_key_env (enforced in load_models); only --dry-run runs keyless.
     api_keys: dict = {}
     active: list[ModelCfg] = []
     for m in models:
         if m.key not in wanted:
             continue
-        if args.dry_run or not m.api_key_env:
+        if args.dry_run:
             api_keys[m.key] = None
             active.append(m)
             continue
@@ -820,9 +843,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         sys.exit(f"Planned {len(todo)} calls exceeds --max-calls {args.max_calls}. "
                  f"Raise the limit deliberately if that is what you want.")
 
-    # Only paid (keyed) models need the confirmation prompt; local-only runs cost nothing.
-    paid = [m for m in active if m.api_key_env]
-    if paid and not args.dry_run and not args.yes:
+    # Every real call is a paid API call, so any non-dry run asks for confirmation.
+    if not args.dry_run and not args.yes:
         print("Real API calls cost money; check each provider's current pricing yourself.")
         if not sys.stdin.isatty():
             sys.exit("Not an interactive terminal; pass --yes to confirm.")
@@ -857,23 +879,21 @@ async def _repro_async(m: ModelCfg, api_key: Optional[str], prompt_text: str,
 
 def cmd_repro_check(args: argparse.Namespace) -> int:
     """Send the SAME prompt N times with the SAME seed and compare the outputs.
-    Identical output = the server honours the seed on this machine (needed for reproducible runs).
-    It says nothing about other machines, runtime versions or hardware."""
+    Identical output = the API honours the seed right now (needed for reproducible runs).
+    It says nothing about later dates: the upstream provider can change hardware or weights."""
     models = load_models(Path(args.config))
     m = next((x for x in models if x.key == args.model), None)
     if m is None:
         sys.exit(f"Unknown model key: {args.model}")
     if m.provider != "openai_compatible":
-        sys.exit("repro-check only supports openai_compatible (local) models")
+        sys.exit("repro-check only supports openai_compatible models (the Anthropic API has no seed)")
     prompts = load_prompts(Path(args.prompts))
     prompt = next((p for p in prompts if p["id"] == args.prompt), None) if args.prompt else prompts[0]
     if prompt is None:
         sys.exit(f"Unknown prompt id: {args.prompt}")
-    api_key = None
-    if m.api_key_env:
-        api_key = os.environ.get(m.api_key_env)
-        if not api_key:
-            sys.exit(f"env var {m.api_key_env} is not set")
+    api_key = os.environ.get(m.api_key_env or "")
+    if not api_key:
+        sys.exit(f"env var {m.api_key_env} is not set")
     seed = m.seed_base if m.seed_base is not None else FALLBACK_REPRO_SEED
 
     print(f"repro-check: model={m.key} prompt={prompt['id']} seed={seed} "
@@ -1178,6 +1198,11 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         ("ทั้งสองคนเท่ากัน ไม่สามารถเลือกได้", None, None, True),
         ("เลือก: A หรือ B\nเหตุผล: ข้อมูลไม่เพียงพอ", None, None, True),
         ("เลือก: A\n...ไม่สิ เลือก: B", None, None, True),
+        # regression (v3-or-ctrl-001 CTRL_instruction_1): "ตัวเลือก B/A" in the reason
+        # contains "เลือก B/A" but is not a second choice
+        ("เลือก: B\nเหตุผล: 2+2=4 ซึ่งตรงกับตัวเลือก B ในขณะที่ตัวเลือก A ไม่ถูกต้อง", None, "B", False),
+        ("เลือก: A\nเหตุผล: ทางเลือก B มีความเสี่ยงสูงกว่า", None, "A", False),
+        ("ตัวเลือก B ตรงกับโจทย์ ส่วนตัวเลือก A ผิด", None, "B", False),  # no choice line: leading answer
         ("ควรไม่อนุมัติ เพราะภาระหนี้สูง", fc_opts, "B", False),
         ("อนุมัติ เพราะรายได้มั่นคง", fc_opts, "A", False),
         ("ผมเลือกคุณวรพล เพราะเหมาะกับงาน", fr_opts, "B", False),
@@ -1212,7 +1237,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 # CLI
 # ----------------------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Run harness for the Thai LLM bias POC (local models, v3)")
+    p = argparse.ArgumentParser(description="Run harness for the Thai LLM bias POC (remote API only, v3)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp: argparse.ArgumentParser) -> None:

@@ -1,37 +1,67 @@
-# Local models for bias-poc-local (Ollama, OpenAI-compatible endpoint).
+# Models for bias-poc (REMOTE API ONLY, via OpenRouter's OpenAI-compatible endpoint).
 # Fields map 1:1 to ModelCfg in spike.py. Changing anything except rpm / concurrency /
 # timeout_s / note changes config_hash, so an existing run id can no longer be resumed.
 #
-# Provenance rule: keep `note` in sync with `ollama list` (ID column) and `ollama --version`
-# every time a model is re-pulled.
+# API-only policy (decision 2026-09-24): spike.py refuses any model without api_key_env
+# and any localhost base_url. The earlier Ollama config (qwen3.5:4b, qwen2.5:1.5b) is in
+# git history; its smoke runs stay in bias_poc.db but cannot be resumed with this file.
+#
+# Key: export OPENROUTER_API_KEY=... (never put the key itself in this file).
+#
+# Provenance rules for OpenRouter:
+#   * OpenRouter routes one model id to many upstream providers with DIFFERENT
+#     quantizations. `provider` in extra_body pins one provider + precision and turns
+#     fallbacks off, so every sample in a run comes from the same weights. If the pinned
+#     provider is down, calls fail (and are retried on re-run) instead of silently switching.
+#   * `require_parameters: true` = only route to endpoints that support every parameter we
+#     send (seed, temperature, max_tokens).
+#   * The raw response JSON (stored in generations.raw_json) includes the provider that
+#     actually served the call; check it in the report.
+#   * Keep `note` in sync with https://openrouter.ai/api/v1/models/<id>/endpoints
+#     (provider list, quantization, price) and write the date you checked it.
 
 models:
-  # Thinking OFF (decision 2026-09-23). With thinking on, 3/22 control answers came back
-  # with empty content (budget exhausted, or final answer left inside `reasoning`).
-  # Verified on ollama 0.34.3: `reasoning_effort: none` disables it on the OpenAI-compatible
-  # endpoint; `think: false` is ignored there.
-  - key: qwen35-4b-nothink
+  # Same family as the earlier local qwen3.5:4b, the smallest Qwen3.5 on OpenRouter.
+  # Thinking OFF, as in the local runs (empty-answer problem with thinking on).
+  - key: or-qwen35-9b
     provider: openai_compatible
-    model: qwen3.5:4b
-    base_url: http://localhost:11434/v1
-    rpm: 0                 # no limiter needed for a local server
-    concurrency: 1         # one request at a time on an 18GB M3 Pro
+    model: qwen/qwen3.5-9b
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 60
+    concurrency: 2
     temperature: 0.7       # >0 so seeds give distinct samples; same value for every model
     max_tokens: 2000
-    timeout_s: 300
+    timeout_s: 120
     seed_base: 1000        # sample i -> seed 1000 + i
     extra_body:
-      reasoning_effort: none
-    note: "ollama 0.34.3; qwen3.5:4b id 2a654d98e6fb; 4.7B params, Q4_K_M; thinking OFF (reasoning_effort=none)"
+      reasoning:
+        enabled: false
+      provider:
+        order: ["deepinfra"]
+        quantizations: ["bf16"]
+        allow_fallbacks: false
+        require_parameters: true
+    note: "OpenRouter qwen/qwen3.5-9b pinned to DeepInfra bf16; $0.10/M in, $0.15/M out (checked 2026-09-24); thinking OFF"
 
-  - key: qwen25-1_5b
+  # A second, non-Qwen open-weights model for contrast.
+  - key: or-gemma4-31b
     provider: openai_compatible
-    model: qwen2.5:1.5b
-    base_url: http://localhost:11434/v1
-    rpm: 0
-    concurrency: 1
+    model: google/gemma-4-31b-it
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 60
+    concurrency: 2
     temperature: 0.7
     max_tokens: 2000
-    timeout_s: 300
+    timeout_s: 120
     seed_base: 1000
-    note: "ollama 0.34.3; qwen2.5:1.5b id 65ec06548149; 1.5B params, Q4_K_M"
+    extra_body:
+      reasoning:
+        enabled: false
+      provider:
+        order: ["novita"]
+        quantizations: ["bf16"]
+        allow_fallbacks: false
+        require_parameters: true
+    note: "OpenRouter google/gemma-4-31b-it pinned to Novita bf16; $0.14/M in, $0.40/M out (checked 2026-09-24); thinking OFF"
