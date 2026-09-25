@@ -4,7 +4,7 @@
 #
 # API-only policy (decision 2026-09-24): spike.py refuses any model without api_key_env
 # and any localhost base_url. The earlier Ollama config (qwen3.5:4b, qwen2.5:1.5b) is in
-# git history; its smoke runs stay in bias_poc.db but cannot be resumed with this file.
+# git history only. All earlier results were wiped on 2026-09-25 (fresh start, no runs).
 #
 # Key: export OPENROUTER_API_KEY=... (never put the key itself in this file).
 #
