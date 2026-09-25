@@ -13,3 +13,6 @@ controls_only.jsonl
 .DS_Store
 __pycache__/
 *.pyc
+
+# Claude desktop app preview config (machine-specific paths)
+.claude/
