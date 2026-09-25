@@ -165,6 +165,9 @@ CREATE INDEX IF NOT EXISTS labels_by_item
 # Columns added after the first version; older database files are upgraded in place.
 # v3 adds NO columns on purpose: parsed fields are derived on read from response_text.
 MIGRATION_COLUMNS = [("seed", "INTEGER"), ("note", "TEXT")]
+# runs.prompts_file (added 2026-09-25): the prompt file a run was started with, so a run that
+# was stopped part-way can still be matched to its question set. NULL for older runs.
+RUNS_MIGRATION_COLUMNS = [("prompts_file", "TEXT")]
 
 
 # ----------------------------------------------------------------------------------------
@@ -696,6 +699,10 @@ def open_db(path: str) -> sqlite3.Connection:
     for column, coltype in MIGRATION_COLUMNS:
         if column not in existing:
             conn.execute(f"ALTER TABLE generations ADD COLUMN {column} {coltype}")
+    existing_runs = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    for column, coltype in RUNS_MIGRATION_COLUMNS:
+        if column not in existing_runs:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {coltype}")
     conn.commit()
     return conn
 
@@ -851,8 +858,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                  f"Otherwise use a new --run-id (recommended: one run = one consistent experiment), "
                  f"or pass --force to override.")
     if not row:
-        db.execute("INSERT INTO runs (run_id, created_at, config_hash, n_samples) VALUES (?,?,?,?)",
-                   (args.run_id, now_iso(), config_hash, args.samples))
+        db.execute("INSERT INTO runs (run_id, created_at, config_hash, n_samples, prompts_file) "
+                   "VALUES (?,?,?,?,?)",
+                   (args.run_id, now_iso(), config_hash, args.samples, Path(args.prompts).name))
         db.commit()
 
     # Work still to do = everything without an 'ok' row (errors are retried on re-run).

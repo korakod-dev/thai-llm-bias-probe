@@ -797,12 +797,21 @@ def _prompt_id_sets() -> dict:
     return out
 
 
-def question_set_of(ids: set) -> Optional[str]:
-    """Which prompt file a run used, recognised by its exact set of prompt ids."""
-    for name, id_set in _prompt_id_sets().items():
+def question_set_of(ids: set, recorded: Optional[str] = None) -> tuple[Optional[str], int]:
+    """
+    (prompt file a run used, number of its prompts).
+    1. runs.prompts_file, recorded by spike.py when the run started (reliable, also for a run
+       stopped part-way) — used if that file still exists and contains every id of the run.
+    2. Older runs: an exact match of the run's prompt ids. A stopped old run cannot be matched
+       reliably (its first ids may belong to several files), so it is reported as unknown.
+    """
+    sets = _prompt_id_sets()
+    if recorded in sets and ids <= sets[recorded]:
+        return recorded, len(sets[recorded])
+    for name, id_set in sets.items():
         if id_set == ids:
-            return name
-    return None
+            return name, len(id_set)
+    return None, len(ids)
 
 
 def _open_read(kind: str) -> sqlite3.Connection:
@@ -821,7 +830,7 @@ def run_summary(kind: str, run_id: str) -> dict:
     min_t = int(th.get("min_independent_templates_per_dimension", 3))
     db = _open_read(kind)
     try:
-        meta = db.execute("SELECT created_at, n_samples FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        meta = db.execute("SELECT created_at, n_samples, prompts_file FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if meta is None:
             raise BadRequest("ไม่พบ run นี้")
         ids = {r[0] for r in db.execute("SELECT DISTINCT prompt_id FROM generations WHERE run_id=?", (run_id,))}
@@ -833,7 +842,9 @@ def run_summary(kind: str, run_id: str) -> dict:
             "json_extract(raw_json, '$.usage.cost') FROM generations WHERE run_id=?", (run_id,)).fetchall()
     finally:
         db.close()
-    qset = question_set_of(ids)
+    qset, qset_size = question_set_of(ids, meta[2])
+    n_samples = int(meta[1] or 1)
+    expected = qset_size * n_samples          # calls each model should have in a complete run
     models: dict = {}
     for mk, mid, status, pid, idx, pj, text, cost in per_model_rows:
         m = models.setdefault(mk, {"key": mk, "model_id": mid, "calls": 0, "errors": 0, "cost": 0.0,
@@ -867,6 +878,10 @@ def run_summary(kind: str, run_id: str) -> dict:
                            "evasive_k": ev_k, "evasive_n": ev_n, "evasive_items": m["evasive_items"][:30],
                            "pos_a": [pa, pt], "gate": gate, "dims": rows})
         # --- what a human still has to do, most important first ---
+        if m["calls"] < expected:
+            todo.append({"level": "must", "model": mk, "action": "rerun",
+                         "text": f"{mk}: รันยังไม่ครบ {m['calls']}/{expected} ครั้ง (ถูกหยุดกลางทาง?) — กด 'รันต่อ' "
+                                 f"ด้วย run id เดิม ระบบจะทำเฉพาะข้อที่ยังไม่มี"})
         if m["errors"]:
             todo.append({"level": "must", "model": mk, "action": "rerun",
                          "text": f"{mk}: มี {m['errors']} call ที่ล้มเหลว — กด 'รันซ้ำ' ด้วย run id เดิม ระบบจะทำเฉพาะข้อที่ขาด"})
@@ -890,16 +905,17 @@ def run_summary(kind: str, run_id: str) -> dict:
     if not any(t["level"] == "must" for t in todo):
         todo.insert(0, {"level": "done", "model": None, "action": None,
                         "text": "ไม่มีงานที่ต้องให้คนยืนยันค้างอยู่ — ดูผลในขั้นที่ 5 ได้เลย"})
-    return {"run_id": run_id, "db": kind, "created_at": meta[0], "n_samples": meta[1],
+    return {"run_id": run_id, "db": kind, "created_at": meta[0], "n_samples": n_samples,
             "question_set": qset, "question_set_label": QUESTION_SETS.get(qset or "", (qset or "ชุดกำหนดเอง", ""))[0],
-            "n_prompts": len(ids), "threshold": threshold, "min_templates": min_t,
-            "models": out_models, "todo": todo}
+            "n_prompts": qset_size, "n_prompts_seen": len(ids),
+            "complete": all(m["calls"] >= expected for m in out_models),
+            "threshold": threshold, "min_templates": min_t, "models": out_models, "todo": todo}
 
 
 def compare_models(kind: str, qset: str) -> dict:
     """
-    Per-dimension comparison across models that ran the SAME question set (latest run per
-    model). No overall ranking (config: reporting.no_single_ranking). For each comparison row a
+    Per-dimension comparison across models that ran the SAME question set completely (latest
+    run per model; a run stopped part-way is left out so every column covers the same items). No overall ranking (config: reporting.no_single_ranking). For each comparison row a
     model is marked 'less'/'more' lean only when its |share-0.5| interval does not overlap
     every other model's interval; otherwise the models cannot be told apart.
     """
@@ -1465,7 +1481,9 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
     <h2>③ รันทดสอบ</h2>
     <div class="recap" id="recap"></div>
     <label for="run_id">ชื่อ run (ตั้งให้อัตโนมัติ แก้ได้)</label>
-    <input type="text" id="run_id" list="run_ids" style="max-width:420px">
+    <div class="row" style="margin-top:0"><input type="text" id="run_id" list="run_ids" style="max-width:420px;flex:1">
+      <button class="ghost small" id="new_name" title="ตั้งชื่อใหม่ = เริ่ม run ใหม่">ชื่อใหม่</button></div>
+    <p class="hint" style="margin-top:4px">ใช้ชื่อเดิม = รันต่อจากที่ค้าง (ทำเฉพาะข้อที่ขาดหรือล้มเหลว) · ชื่อใหม่ = เริ่ม run ใหม่ทั้งหมด</p>
     <datalist id="run_ids"></datalist>
     <div id="run_warn"></div>
     <div class="row">
@@ -1648,6 +1666,7 @@ function renderModels() {
 }
 $("model_cards").addEventListener("change", () => {
   SEL = new Set([...document.querySelectorAll('input[name=mk]:checked')].map(x => x.value)); markDone();
+  $("run_id").dataset.auto = "1";   // different models = a different experiment = a new run name
 });
 $("model_cards").addEventListener("click", async e => {
   const k = e.target.dataset.remove; if (!k) return;
@@ -1669,6 +1688,7 @@ function renderQsets() {
 $("qset_cards").addEventListener("change", () => {
   QSET = (document.querySelector('input[name=qs]:checked') || {}).value;
   $("samples").value = QSET === "prompts_v3.jsonl" ? "3" : "1"; markDone();
+  $("run_id").dataset.auto = "1";
 });
 $("to3").addEventListener("click", () => { if (!QSET) return alert("เลือกชุดคำถาม"); go(3); });
 
@@ -1702,6 +1722,8 @@ async function renderRecap() {
   }
 }
 $("run_id").addEventListener("input", () => { $("run_id").dataset.auto = "0"; });
+function newRunName() { $("run_id").dataset.auto = "1"; if (STEP === "3") renderRecap(); }
+$("new_name").addEventListener("click", newRunName);
 $("go").addEventListener("click", async () => {
   if (!SEL.size) return alert("เลือกโมเดลในขั้นที่ 1 ก่อน");
   const f = S.prompt_files.find(x => x.name === QSET) || {count: 0};
@@ -1718,13 +1740,15 @@ $("go").addEventListener("click", async () => {
     await api("/api/job", req);
     CUR = (req.dry_run ? "dry" : "real") + "|" + req.run_id; store.set("bias_last_run", CUR);
     outLen = 0; $("out").textContent = ""; $("a_out").textContent = ""; $("run_done").hidden = true;
-    $("run_id").dataset.auto = "1";
+    // Keep this name after the run: pressing "เริ่มรัน" again RESUMES it (only missing/failed
+    // calls). A fresh auto name is made only when models / question set / samples change.
+    $("run_id").dataset.auto = "0";
     startPolling();
   } catch (e) { alert(e.message); }
 });
 $("stop").addEventListener("click", () => api("/api/job/stop", {}).catch(e => alert(e.message)));
-$("dry_run").addEventListener("change", () => { if (STEP === "3") renderRecap(); });
-$("samples").addEventListener("change", () => { if (STEP === "3") renderRecap(); });
+$("dry_run").addEventListener("change", newRunName);
+$("samples").addEventListener("change", newRunName);
 
 async function poll() {
   const j = await api("/api/job?since=" + outLen).catch(() => null);
@@ -1768,7 +1792,8 @@ async function poll() {
       $("run_done").className = "note " + (j.exit_code === 0 ? "ok" : "warn");
       $("run_done").innerHTML = j.exit_code === 0
         ? `✓ รันเสร็จ ${ok ? ok[1] + " ข้อ" : ""} · <button class="small" data-go="4">ไปขั้นที่ 4: ดูงานที่ต้องตรวจ →</button>`
-        : (failed ? `รันเสร็จแต่มี ${failed} ครั้งที่ล้มเหลว — กด "เริ่มรัน" อีกครั้งด้วยชื่อ run เดิมเพื่อลองใหม่ หรือไปขั้นที่ 4 <button class="small" data-go="4">ขั้นที่ 4 →</button>`
+        : (failed ? `รันเสร็จแต่มี ${failed} ครั้งที่ล้มเหลว — กด "เริ่มรัน" อีกครั้ง (ชื่อเดิม) เพื่อลองเฉพาะข้อที่ล้มเหลว หรือไปขั้นที่ 4 <button class="small" data-go="4">ขั้นที่ 4 →</button>`
+           : j.exit_code < 0 ? `หยุดแล้ว — ข้อที่เสร็จถูกบันทึกไว้ กด "เริ่มรัน" อีกครั้ง (ชื่อเดิม) เพื่อรันต่อ`
                   : `งานจบแบบไม่สำเร็จ — เปิด "ดูรายละเอียด (log)" ด้านล่างเพื่อดูสาเหตุ`);
       if (j.exit_code !== 0 && !failed) $("logbox").open = true;
       markDone();
@@ -1804,7 +1829,7 @@ async function loadReview() {
 function renderTodo(s) {
   const icon = {must: "!", should: "?", info: "i", done: "✓"};
   const btn = (t) => t.action === "label" ? `<button class="small" data-act="label">ติดป้ายด้านล่าง ↓</button>`
-    : t.action === "rerun" ? `<button class="small" data-act="rerun" data-model="${esc(t.model)}">รันซ้ำ</button>`
+    : t.action === "rerun" ? `<button class="small" data-act="rerun" data-model="${esc(t.model)}">รันต่อ / ลองใหม่</button>`
     : t.action === "show" ? `<button class="small ghost" data-act="show" data-model="${esc(t.model)}">เปิดอ่าน</button>` : "";
   $("todo").innerHTML = s.todo.map(t => `<li class="${t.level}"><span class="ic">${icon[t.level]}</span><span class="tx">${esc(t.text)}</span>${btn(t)}</li>`).join("");
 }
@@ -1816,7 +1841,7 @@ $("todo").addEventListener("click", async e => {
   if (b.dataset.act === "rerun") {
     const r = S.runs.find(x => x.db === db && x.run_id === run_id);
     const models = r ? Object.keys(r.models) : [];
-    if (!confirm(`รันซ้ำ run "${run_id}" เฉพาะข้อที่ยังไม่สำเร็จ${db === "real" ? " (อาจเสียเงินเล็กน้อย)" : ""}?`)) return;
+    if (!confirm(`รัน "${run_id}" ต่อ เฉพาะข้อที่ยังไม่มีหรือล้มเหลว${db === "real" ? " (ถ้าเป็นโมเดลเสียเงินจะเสียเงินเล็กน้อย)" : ""}?`)) return;
     const f = [...S.prompt_files];   // the run's question set is inferred by the server summary
     const s = await api("/api/run/summary?" + new URLSearchParams({db, run_id}));
     if (!s.question_set) return alert("ไม่รู้ว่า run นี้ใช้ไฟล์คำถามไหน ใช้หน้า ⚙ ขั้นสูง หรือ CLI แทน");
@@ -1824,7 +1849,8 @@ $("todo").addEventListener("click", async e => {
     try {
       await api("/api/job", {command: "run", run_id, prompts: s.question_set, models, samples: s.n_samples,
                              dry_run: db === "dry", confirm_cost: true, max_calls: Math.max(1, qf.count * s.n_samples * models.length)});
-      go(3); outLen = 0; $("out").textContent = ""; startPolling();
+      $("run_id").value = run_id; $("run_id").dataset.auto = "0";
+      go(3); outLen = 0; $("out").textContent = ""; $("run_done").hidden = true; startPolling();
     } catch (err) { alert(err.message); }
   }
 });
@@ -1947,6 +1973,7 @@ async function loadSummary() {
     const must = s.todo.filter(t => t.level === "must").length;
     $("sum_head").innerHTML =
       `<div class="note info">ชุดคำถาม: <b>${esc(s.question_set_label)}</b> (${s.n_prompts} ข้อ × ${s.n_samples} ครั้ง) · เกณฑ์ข้อสอบควบคุม ≥ ${pct(s.threshold)} (ตั้งไว้ล่วงหน้า)</div>` +
+      (!s.complete ? `<div class="note warn">run นี้ยังไม่ครบ (มี ${s.n_prompts_seen}/${s.n_prompts} ข้อ) จึงยังไม่ถูกนำไปเทียบกับโมเดลอื่น — รันต่อได้ในขั้นที่ 4</div>` : "") +
       (must ? `<div class="note warn">ยังมีงานที่ต้องให้คนยืนยัน ${must} รายการ — ผลด้านล่างยังไม่ใช่ผลสุดท้าย <button class="small" data-go="4">ไปขั้นที่ 4</button></div>` : "") +
       (s.question_set === "prompts_v3_mini.jsonl" ? `<div class="note warn">นี่คือ<b>ชุดทดลอง</b> (มิติละ 1 template) ใช้ทำความเข้าใจการทำงานเท่านั้น ยังสรุปเรื่องอคติไม่ได้ ต้องใช้ชุดเต็ม</div>` : "");
     $("sum_models").innerHTML = s.models.map(m => {
