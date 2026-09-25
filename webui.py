@@ -2,16 +2,18 @@
 """
 webui.py - a small local web UI for spike.py (bias-poc v3, remote API only).
 
-What it does:
-  * RUN view: pick any of the configured models, build a spike.py command from a form, run it
-    as a subprocess and stream its output. One job at a time; a Stop button terminates it.
-    Shows an estimated cost before a paid run. Lists existing runs and label CSVs.
-  * LABEL view ("ติดป้าย"): judge each direct_question control answer right/wrong in the
-    browser (question, expected answer and the full response side by side; blind by default).
-    Labels go to the append-only labels table via spike.write_label(); `score` uses them.
-  * MODELS view: browse the public OpenRouter catalog (no key needed), pick ANY model, choose
-    which upstream provider / quantization to pin, and add it to config/models.yaml. Models
-    added here can be removed here again; the two core entries are never touched.
+What it does (5 steps + advanced):
+  1 โมเดล       pick models (default: default_models in config/models.yaml, a free model);
+                "+ เพิ่มโมเดล" browses the public OpenRouter catalog and appends a pinned entry.
+  2 ชุดคำถาม    pick a question set: trial (prompts_v3_mini.jsonl, 34), controls (22), full (174).
+  3 รัน         one button; progress bar, cost estimate, stop; spike.py run underneath.
+  4 ตรวจโดยคน   the run's to-do list for a human (failed calls, unlabelled direct_question
+                controls, control-gate failures, evasive answers, too few templates) and the
+                blind labelling UI (append-only labels table via spike.write_label()).
+  5 สรุป & เทียบ per-model summary (control gate, cost, evasion, position A) and a per-dimension
+                comparison with every other model that ran the same question set. No overall
+                ranking (config: reporting.no_single_ranking).
+  ⚙ ขั้นสูง     runs table and the raw spike.py commands (score/summary/show/export/repro/selftest).
 
 It does NOT change how anything is measured: every action is an ordinary spike.py call and a
 model added here is an ordinary config entry, so the CLI and the UI produce identical evidence.
@@ -628,9 +630,22 @@ def list_runs() -> list[dict]:
     return runs
 
 
+def default_models() -> list[str]:
+    try:
+        data = yaml.safe_load(read_config_text()) or {}
+    except yaml.YAMLError:
+        return []
+    return [str(k) for k in (data.get("default_models") or [])]
+
+
 def state() -> dict:
-    return {"models": load_models(), "prompt_files": prompt_files(), "label_csvs": label_csvs(),
-            "runs": list_runs(), "job": JOB.snapshot(0), "api_key_env": API_KEY_ENV}
+    files = prompt_files()
+    for f in files:
+        label, desc = QUESTION_SETS.get(f["name"], (None, ""))
+        f["label"], f["desc"] = label, desc
+    return {"models": load_models(), "default_models": default_models(), "prompt_files": files,
+            "label_csvs": label_csvs(), "runs": list_runs(), "job": JOB.snapshot(0),
+            "api_key_env": API_KEY_ENV}
 
 
 # ----------------------------------------------------------------------------------------
@@ -740,6 +755,206 @@ def get_history(kind: str, run_id: str, gen_id: str) -> list:
         return spike.label_history(db, run_id, p, m, i)
     finally:
         db.close()
+
+
+# ----------------------------------------------------------------------------------------
+# Run summary, human to-do list and per-dimension comparison
+# ----------------------------------------------------------------------------------------
+# Known question sets, shown as cards in step 2 (other *.jsonl files are listed as "อื่นๆ").
+QUESTION_SETS = {
+    "prompts_v3_mini.jsonl": ("ชุดทดลอง", "ดูภาพรวมทุกขั้นตอนแบบเร็ว: ข้อสอบควบคุม 6 ข้อ + มิติละ 1 template "
+                              "(7 มิติ) ใช้ทำความเข้าใจการทำงาน สรุปผลจริงไม่ได้"),
+    "controls_only.jsonl": ("ข้อสอบควบคุม", "22 ข้อง่ายๆ ที่มีเฉลย เช็คว่าโมเดลเข้าใจภาษาไทยและทำตามคำสั่งได้ "
+                            "ควรผ่าน ≥80% ก่อนรันชุดเต็ม"),
+    "prompts_v3.jsonl": ("ชุดเต็ม", "174 ข้อ ครบทุกมิติ มิติละ ≥3 template สำหรับผลที่ใช้สรุปได้ "
+                         "(แนะนำ samples = 3)"),
+}
+DIMENSION_TH = {
+    "accent": "สำเนียง", "region": "ภูมิภาค", "institution": "สถาบันการศึกษา", "gender": "เพศ",
+    "age": "อายุ", "religion_via_name": "ศาสนา (จากชื่อ)", "nationality": "สัญชาติ",
+    "gender_x_region": "เพศ × ภูมิภาค",
+}
+VARIANT_TH = {
+    "isan": "อีสาน", "bangkok": "กรุงเทพฯ", "south": "ใต้", "central": "กลาง",
+    "top_university": "มหาวิทยาลัยชั้นนำ", "rajabhat": "ราชภัฏ", "male": "ชาย", "female": "หญิง",
+    "young": "อายุน้อย", "older": "อายุมาก", "buddhist_name": "ชื่อพุทธ", "muslim_name": "ชื่อมุสลิม",
+    "thai": "ไทย", "myanmar": "เมียนมา", "female_isan": "หญิงอีสาน", "female_bangkok": "หญิงกรุงเทพฯ",
+    "male_isan": "ชายอีสาน", "male_bangkok": "ชายกรุงเทพฯ",
+}
+
+
+def _thresholds() -> dict:
+    return spike.load_thresholds(ROOT / spike.DEFAULT_THRESHOLDS)
+
+
+def _prompt_id_sets() -> dict:
+    out = {}
+    for f in prompt_files():
+        try:
+            out[f["name"]] = frozenset(p["id"] for p in spike.load_prompts(ROOT / f["name"]))
+        except SystemExit:
+            continue
+    return out
+
+
+def question_set_of(ids: set) -> Optional[str]:
+    """Which prompt file a run used, recognised by its exact set of prompt ids."""
+    for name, id_set in _prompt_id_sets().items():
+        if id_set == ids:
+            return name
+    return None
+
+
+def _open_read(kind: str) -> sqlite3.Connection:
+    if kind not in DBS or not DBS[kind].exists():
+        raise BadRequest("ไม่พบฐานข้อมูล")
+    db = spike.open_db(str(DBS[kind]))
+    db.execute("PRAGMA busy_timeout = 10000")
+    return db
+
+
+def run_summary(kind: str, run_id: str) -> dict:
+    if not RUN_ID_RE.match(run_id or ""):
+        raise BadRequest("run id ไม่ถูกรูปแบบ")
+    th = _thresholds()
+    threshold = float(th["control_pass_threshold"])
+    min_t = int(th.get("min_independent_templates_per_dimension", 3))
+    db = _open_read(kind)
+    try:
+        meta = db.execute("SELECT created_at, n_samples FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if meta is None:
+            raise BadRequest("ไม่พบ run นี้")
+        ids = {r[0] for r in db.execute("SELECT DISTINCT prompt_id FROM generations WHERE run_id=?", (run_id,))}
+        stats = spike.compute_score(db, run_id, spike.human_control_map(db, run_id))
+        dims = spike.bias_by_dimension(db, run_id)
+        labels = spike.current_labels(db, run_id)
+        per_model_rows = db.execute(
+            "SELECT model_key, model_id, status, prompt_id, sample_idx, prompt_json, response_text, "
+            "json_extract(raw_json, '$.usage.cost') FROM generations WHERE run_id=?", (run_id,)).fetchall()
+    finally:
+        db.close()
+    qset = question_set_of(ids)
+    models: dict = {}
+    for mk, mid, status, pid, idx, pj, text, cost in per_model_rows:
+        m = models.setdefault(mk, {"key": mk, "model_id": mid, "calls": 0, "errors": 0, "cost": 0.0,
+                                   "label_need": 0, "label_done": 0, "evasive_items": []})
+        m["calls"] += 1
+        m["cost"] += float(cost or 0)
+        if status != "ok":
+            m["errors"] += 1
+            continue
+        prompt = json.loads(pj)
+        if spike.label_applies("human_control_correct", prompt, {}):
+            m["label_need"] += 1
+            if labels.get((pid, mk, idx), {}).get("human_control_correct"):
+                m["label_done"] += 1
+        if prompt.get("format") in spike.V3_AB_FORMATS and not prompt.get("is_control"):
+            if spike.analyse_generation(prompt, status, text).get("evasive"):
+                m["evasive_items"].append(f"{pid}#{idx}")
+    out_models, todo = [], []
+    for mk, m in sorted(models.items()):
+        st = stats.get(mk)
+        gate = spike.gate_verdict(st, threshold) if st else None
+        ev_k = sum(v[0] for v in st["evasive"].values()) if st else 0
+        ev_n = sum(v[1] for v in st["evasive"].values()) if st else 0
+        pa, pt = st["pos_a"] if st else (0, 0)
+        rows = dims.get(mk, [])
+        for r in rows:
+            r["dimension_th"] = DIMENSION_TH.get(r["dimension"], r["dimension"])
+            r["group1_th"] = VARIANT_TH.get(r["group1"], r["group1"])
+            r["group2_th"] = VARIANT_TH.get(r["group2"], r["group2"])
+        out_models.append({**{k: v for k, v in m.items() if k != "evasive_items"},
+                           "evasive_k": ev_k, "evasive_n": ev_n, "evasive_items": m["evasive_items"][:30],
+                           "pos_a": [pa, pt], "gate": gate, "dims": rows})
+        # --- what a human still has to do, most important first ---
+        if m["errors"]:
+            todo.append({"level": "must", "model": mk, "action": "rerun",
+                         "text": f"{mk}: มี {m['errors']} call ที่ล้มเหลว — กด 'รันซ้ำ' ด้วย run id เดิม ระบบจะทำเฉพาะข้อที่ขาด"})
+        if m["label_need"] > m["label_done"]:
+            todo.append({"level": "must", "model": mk, "action": "label",
+                         "text": f"{mk}: ติดป้ายข้อสอบควบคุมแบบถามตรง {m['label_done']}/{m['label_need']} ข้อ — "
+                                 f"ต้องครบก่อนผลข้อสอบควบคุมจะเป็นผลสุดท้าย"})
+        if gate and gate["verdict"] == "FAIL":
+            todo.append({"level": "must", "model": mk, "action": None,
+                         "text": f"{mk}: ข้อสอบควบคุมได้ {gate['k']}/{gate['n']} ต่ำกว่าเกณฑ์ {threshold:.0%} — "
+                                 f"{'ยังเป็นผลชั่วคราว ติดป้ายให้ครบก่อน' if gate['provisional'] else 'ห้ามตีความผลอคติของโมเดลนี้ใน run นี้'}"})
+        if m["evasive_items"]:
+            todo.append({"level": "should", "model": mk, "action": "show",
+                         "text": f"{mk}: มีคำตอบเลี่ยงไม่เลือก {len(m['evasive_items'])} ข้อ — ควรเปิดอ่านว่าเป็นการปฏิเสธ "
+                                 f"หรือให้เหตุผลที่สมเหตุสมผล (ไม่นับเป็นคะแนน)"})
+    few = sorted({r["dimension_th"] for m in out_models for r in m["dims"] if r["n_templates"] < min_t})
+    if few:
+        todo.append({"level": "info", "model": None, "action": None,
+                     "text": f"มิติที่มี template น้อยกว่า {min_t} ({', '.join(few)}) — ใช้ดูภาพรวมได้ แต่ยังสรุปเรื่องอคติไม่ได้ "
+                             f"ตามเกณฑ์ที่ตั้งไว้ล่วงหน้า ต้องรันชุดเต็ม"})
+    if not any(t["level"] == "must" for t in todo):
+        todo.insert(0, {"level": "done", "model": None, "action": None,
+                        "text": "ไม่มีงานที่ต้องให้คนยืนยันค้างอยู่ — ดูผลในขั้นที่ 5 ได้เลย"})
+    return {"run_id": run_id, "db": kind, "created_at": meta[0], "n_samples": meta[1],
+            "question_set": qset, "question_set_label": QUESTION_SETS.get(qset or "", (qset or "ชุดกำหนดเอง", ""))[0],
+            "n_prompts": len(ids), "threshold": threshold, "min_templates": min_t,
+            "models": out_models, "todo": todo}
+
+
+def compare_models(kind: str, qset: str) -> dict:
+    """
+    Per-dimension comparison across models that ran the SAME question set (latest run per
+    model). No overall ranking (config: reporting.no_single_ranking). For each comparison row a
+    model is marked 'less'/'more' lean only when its |share-0.5| interval does not overlap
+    every other model's interval; otherwise the models cannot be told apart.
+    """
+    th = _thresholds()
+    threshold = float(th["control_pass_threshold"])
+    min_t = int(th.get("min_independent_templates_per_dimension", 3))
+    target = _prompt_id_sets().get(qset)
+    if target is None:
+        raise BadRequest("ไม่รู้จักชุดคำถามนี้")
+    db = _open_read(kind)
+    try:
+        runs = db.execute("SELECT run_id, created_at FROM runs ORDER BY created_at DESC").fetchall()
+        columns, seen = [], set()
+        for run_id, created in runs:
+            ids = {r[0] for r in db.execute("SELECT DISTINCT prompt_id FROM generations WHERE run_id=?", (run_id,))}
+            if ids != target:
+                continue
+            stats = spike.compute_score(db, run_id, spike.human_control_map(db, run_id))
+            dims = spike.bias_by_dimension(db, run_id)
+            for mk in sorted(dims):
+                if mk in seen:
+                    continue   # an older run of a model already shown
+                seen.add(mk)
+                gate = spike.gate_verdict(stats[mk], threshold) if mk in stats else None
+                columns.append({"model": mk, "run_id": run_id, "created_at": created, "gate": gate,
+                                "rows": {f"{r['dimension']}|{r['group1']}|{r['group2']}": r for r in dims[mk]}})
+    finally:
+        db.close()
+    keys = sorted({k for c in columns for k in c["rows"]})
+    rows = []
+    for k in keys:
+        dim, g1, g2 = k.split("|")
+        cells = []
+        for c in columns:
+            r = c["rows"].get(k)
+            usable = bool(r and r["n"] and c["gate"] and c["gate"]["verdict"] == "PASS")
+            cells.append({"model": c["model"], **(r or {}), "usable": usable})
+        live = [x for x in cells if x["usable"]]
+        for x in live:
+            others = [o for o in live if o is not x]
+            if not others:
+                x["vs"] = None
+            elif all(x["gap_hi"] < o["gap_lo"] for o in others):
+                x["vs"] = "less"     # clearly the smallest lean of all compared models
+            elif all(x["gap_lo"] > o["gap_hi"] for o in others):
+                x["vs"] = "more"     # clearly the largest lean
+            else:
+                x["vs"] = "similar"
+        n_t = max((x.get("n_templates") or 0) for x in cells) if cells else 0
+        rows.append({"dimension": dim, "dimension_th": DIMENSION_TH.get(dim, dim),
+                     "group1": g1, "group2": g2, "group1_th": VARIANT_TH.get(g1, g1),
+                     "group2_th": VARIANT_TH.get(g2, g2), "n_templates": n_t,
+                     "enough_templates": n_t >= min_t, "cells": cells})
+    return {"question_set": qset, "db": kind, "threshold": threshold, "min_templates": min_t,
+            "columns": [{k: v for k, v in c.items() if k != "rows"} for c in columns], "rows": rows}
 
 
 # ----------------------------------------------------------------------------------------
@@ -940,6 +1155,15 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/job":
             since = int(one("since", "0") or 0)
             return self._json(JOB.snapshot(max(0, since)))
+        if url.path in ("/api/run/summary", "/api/compare"):
+            if not self._token_ok():
+                return self._json({"error": "token ไม่ถูกต้อง (รีเฟรชหน้าเว็บ)"}, 403)
+            try:
+                if url.path == "/api/run/summary":
+                    return self._json(run_summary(one("db"), one("run_id")))
+                return self._json(compare_models(one("db"), one("qset")))
+            except BadRequest as exc:
+                return self._json({"error": str(exc)}, 400)
         if url.path in ("/api/label/items", "/api/label/history"):
             if not self._token_ok():
                 return self._json({"error": "token ไม่ถูกต้อง (รีเฟรชหน้าเว็บ)"}, 403)
@@ -1021,593 +1245,668 @@ PAGE = r"""<!doctype html>
 <style>
 :root {
   --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
-  --accent: #2f5d8a; --accent-ink: #ffffff; --ok: #2e7d4f; --warn: #a15c00; --bad: #b3261e;
+  --accent: #2f5d8a; --accent-ink: #ffffff; --accent-soft: #e6eef6;
+  --ok: #2e7d4f; --ok-soft: #e5f2ea; --warn: #a15c00; --warn-soft: #fbf0df; --bad: #b3261e; --bad-soft: #f9e4e2;
   --code-bg: #1e1f22; --code-ink: #e6e6e3; --hover: #f0eee8;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161615; --panel: #1f1f1d; --ink: #ecebe7; --muted: #a09e98; --line: #34332f;
-    --accent: #7fb0e0; --accent-ink: #10202f; --ok: #6cc28f; --warn: #e0a24a; --bad: #f08a80;
+    --accent: #7fb0e0; --accent-ink: #10202f; --accent-soft: #1d2a36;
+    --ok: #6cc28f; --ok-soft: #1a2b21; --warn: #e0a24a; --warn-soft: #2e2415; --bad: #f08a80; --bad-soft: #321c1a;
     --code-bg: #0f0f0e; --code-ink: #dcdcd8; --hover: #2a2926;
   }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink);
-  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Sukhumvit Set", "Thonburi", "Segoe UI", sans-serif; }
-main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 60px; }
-h1 { font-size: 20px; margin: 0 0 4px; }
-h2 { font-size: 15px; margin: 0 0 12px; }
-.sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
-.grid { display: grid; gap: 16px; grid-template-columns: 1fr; }
-@media (min-width: 900px) { .grid { grid-template-columns: 380px 1fr; } }
-@media (min-width: 900px) { .grid.wide { grid-template-columns: 1.15fr 1fr; } }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
-.stack > * + * { margin-top: 16px; }
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Sukhumvit Set", "Thonburi", "Segoe UI", sans-serif; }
+main { max-width: 1040px; margin: 0 auto; padding: 20px 16px 80px; }
+h1 { font-size: 21px; margin: 0; }
+h2 { font-size: 18px; margin: 0 0 4px; }
+h3 { font-size: 15px; margin: 18px 0 8px; }
+p { margin: 6px 0; }
+.sub { color: var(--muted); font-size: 13.5px; }
+.top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; min-width: 0; }
+.stack > * + * { margin-top: 14px; }
 label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
-input[type=text], input[type=number], input[type=search], select {
-  width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px;
+input[type=text], input[type=number], input[type=search], select, textarea {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--bg); color: var(--ink); font: inherit; }
-.check { display: flex; align-items: center; gap: 8px; color: var(--ink); margin: 6px 0; font-size: 14px; }
-.check label { margin: 0; color: inherit; }
-.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-.tabs button { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-.tabs button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-.nav { display: flex; gap: 8px; margin: 0 0 16px; }
-.nav button { padding: 8px 18px; }
-button { padding: 7px 14px; border: 0; border-radius: 7px; font: inherit; cursor: pointer;
+textarea { resize: vertical; }
+button { padding: 8px 16px; border: 0; border-radius: 8px; font: inherit; cursor: pointer;
   background: var(--accent); color: var(--accent-ink); }
 button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+button.big { padding: 12px 26px; font-size: 16px; font-weight: 600; }
+button.small { padding: 3px 10px; font-size: 13px; }
 button.danger { background: var(--bad); color: #fff; }
-button.small { padding: 2px 9px; font-size: 12.5px; }
+button.okbtn { background: var(--ok); color: #fff; }
+button.badbtn { background: var(--bad); color: #fff; }
 button:disabled { opacity: .45; cursor: default; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
 .between { justify-content: space-between; }
-.pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 99px; border: 1px solid currentColor; }
+.pill { display: inline-block; font-size: 12.5px; padding: 1px 9px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
 .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
-.hint { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
-.box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-top: 10px; }
-.box.warnbox { border-color: var(--warn); }
-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 500; }
-td.actions { white-space: nowrap; }
-td.actions button { padding: 3px 9px; font-size: 12.5px; }
-td.num, th.num { text-align: right; white-space: nowrap; }
-tr.pick { cursor: pointer; }
-tr.pick:hover { background: var(--hover); }
-tr.sel { background: var(--hover); outline: 2px solid var(--accent); outline-offset: -2px; }
-.scroll { overflow-x: auto; }
-.list { max-height: 520px; overflow: auto; }
-pre#out { background: var(--code-bg); color: var(--code-ink); margin: 0; padding: 12px; border-radius: 8px;
-  height: 420px; overflow: auto; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
-  white-space: pre-wrap; word-break: break-word; }
-.cmdline { font: 12px ui-monospace, Menlo, monospace; color: var(--muted); word-break: break-all; }
-.models div.m { margin: 8px 0; font-size: 13.5px; }
-.tag { display: inline-block; font-size: 11.5px; padding: 0 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); margin-right: 3px; }
-.tag.g { color: var(--ok); border-color: var(--ok); }
-.mono { font: 12.5px ui-monospace, Menlo, monospace; word-break: break-all; }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.chips button { padding: 3px 10px; font-size: 12.5px; background: transparent; color: var(--ink); border: 1px solid var(--line); }
-.chips button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; padding: 5px 6px; position: sticky; top: 0; }
-.filters { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
-.filters .check { margin: 0; }
-.filters select { width: auto; }
-.lbar { display: grid; gap: 12px; grid-template-columns: 1fr; }
-@media (min-width: 760px) { .lbar { grid-template-columns: 1.4fr 1fr 1.3fr; } }
-.progress { height: 6px; background: var(--line); border-radius: 99px; margin-top: 14px; overflow: hidden; }
-.progress div { height: 100%; width: 0; background: var(--ok); transition: width .2s; }
-.qa { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
-.qa.expected { border-color: var(--ok); }
-.qlabel { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-.qtext { white-space: pre-wrap; word-break: break-word; font-size: 14.5px; }
-.qtext.resp { max-height: 420px; overflow: auto; }
-.okbtn { background: var(--ok); color: #fff; }
-.badbtn { background: var(--bad); color: #fff; }
-.kbd { display: inline-block; font: 11px ui-monospace, Menlo, monospace; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; opacity: .8; }
-textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--ink); font: inherit; resize: vertical; }
+.hint { font-size: 13px; color: var(--muted); margin-top: 8px; }
+.note { border-radius: 8px; padding: 10px 12px; font-size: 13.5px; margin-top: 12px; }
+.note.info { background: var(--accent-soft); }
+.note.warn { background: var(--warn-soft); color: var(--ink); }
+.note.bad { background: var(--bad-soft); color: var(--ink); }
+.note.ok { background: var(--ok-soft); color: var(--ink); }
 [hidden] { display: none !important; }
+
+/* stepper */
+.steps { display: flex; gap: 4px; margin: 0 0 16px; overflow-x: auto; padding-bottom: 2px; }
+.steps button { flex: 1 0 auto; display: flex; align-items: center; gap: 8px; background: var(--panel); color: var(--muted);
+  border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; text-align: left; font-size: 14px; }
+.steps button .n { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 99px;
+  border: 1.5px solid currentColor; font-size: 13px; font-weight: 600; flex: none; }
+.steps button.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.steps button.done .n { background: var(--ok); border-color: var(--ok); color: #fff; }
+.steps button.adv { flex: 0 0 auto; }
+
+/* selectable cards */
+.choices { display: grid; gap: 10px; grid-template-columns: 1fr; margin-top: 12px; }
+@media (min-width: 720px) { .choices.three { grid-template-columns: repeat(3, 1fr); } .choices.two { grid-template-columns: repeat(2, 1fr); } }
+.choice { position: relative; display: block; border: 1.5px solid var(--line); border-radius: 10px; padding: 12px 14px 12px 42px;
+  cursor: pointer; margin: 0; color: var(--ink); font-size: 14px; background: var(--panel); }
+.choice input { position: absolute; left: 14px; top: 15px; width: 17px; height: 17px; margin: 0; }
+.choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.choice .t { font-weight: 600; font-size: 15px; }
+.choice .d { color: var(--muted); font-size: 13px; margin-top: 3px; }
+.choice .meta { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+.tag { display: inline-block; font-size: 12px; padding: 0 7px; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); }
+.tag.g { color: var(--ok); border-color: var(--ok); } .tag.w { color: var(--warn); border-color: var(--warn); } .tag.b { color: var(--bad); border-color: var(--bad); }
+details { margin-top: 14px; }
+details > summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+
+/* run */
+.recap { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 14.5px; margin-top: 10px; }
+.recap div:nth-child(odd) { color: var(--muted); }
+.progress { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 14px; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.progress.done > div { background: var(--ok); }
+pre.log { background: var(--code-bg); color: var(--code-ink); margin: 8px 0 0; padding: 12px; border-radius: 8px;
+  max-height: 360px; overflow: auto; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-word; }
+
+/* todo */
+.todo { list-style: none; padding: 0; margin: 10px 0 0; }
+.todo li { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+.todo li .ic { flex: none; width: 22px; text-align: center; font-weight: 700; }
+.todo li .tx { flex: 1; font-size: 14px; }
+.todo li.must { border-color: var(--bad); } .todo li.must .ic { color: var(--bad); }
+.todo li.should .ic { color: var(--warn); } .todo li.info .ic { color: var(--muted); }
+.todo li.done { border-color: var(--ok); } .todo li.done .ic { color: var(--ok); }
+
+/* label */
+.qa { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+.qa.expected { border-color: var(--ok); }
+.qlabel { font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+.qtext { white-space: pre-wrap; word-break: break-word; font-size: 14.5px; }
+.qtext.resp { max-height: 380px; overflow: auto; }
+.kbd { display: inline-block; font: 11px ui-monospace, Menlo, monospace; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; opacity: .8; }
+.lprog { height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 10px; }
+.lprog div { height: 100%; width: 0; background: var(--ok); transition: width .2s; }
+
+/* tables */
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th, td { text-align: left; padding: 8px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
+td.num, th.num { text-align: right; white-space: nowrap; }
+.lean { display: flex; align-items: center; gap: 6px; min-width: 150px; }
+.bar { position: relative; flex: 1; height: 8px; background: var(--line); border-radius: 99px; min-width: 70px; }
+.bar .mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--muted); }
+.bar .ci { position: absolute; top: 0; bottom: 0; background: var(--accent); opacity: .35; border-radius: 99px; }
+.bar .pt { position: absolute; top: -2px; width: 4px; height: 12px; margin-left: -2px; background: var(--accent); border-radius: 2px; }
+.cellbox { font-size: 13px; }
+.cellbox .l1 { white-space: nowrap; }
+.mcards { display: grid; gap: 12px; grid-template-columns: 1fr; margin-top: 10px; }
+@media (min-width: 760px) { .mcards { grid-template-columns: repeat(2, 1fr); } }
+.mcard { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; font-size: 13.5px; margin-top: 6px; }
+.kv div:nth-child(odd) { color: var(--muted); }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+
+/* catalog (add model) */
+.catlist { max-height: 460px; overflow: auto; }
+tr.pick { cursor: pointer; } tr.pick:hover { background: var(--hover); }
+tr.sel { background: var(--hover); outline: 2px solid var(--accent); outline-offset: -2px; }
+tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; padding: 5px 8px; position: sticky; top: 0; }
+.vchips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.vchips button { padding: 3px 10px; font-size: 12.5px; background: transparent; color: var(--ink); border: 1px solid var(--line); }
+.vchips button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.mono { font: 12.5px ui-monospace, Menlo, monospace; word-break: break-all; }
+.grid2 { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 900px) { .grid2 { grid-template-columns: 1.2fr 1fr; } }
 </style>
 </head>
 <body>
 <main>
-  <h1>Bias POC Runner</h1>
-  <p class="sub">หน้านี้เรียก <code>spike.py</code> บนเครื่องนี้ ทุกปุ่มเท่ากับรันคำสั่งเดียวกับ CLI ผลที่ได้จึงเหมือนกันทุกประการ</p>
-
-  <div class="nav" id="nav">
-    <button data-view="run" class="on">รันทดสอบ</button>
-    <button data-view="label" class="ghost">ติดป้าย</button>
-    <button data-view="models" class="ghost">เลือกโมเดล</button>
+  <div class="top">
+    <div>
+      <h1>Bias POC — ทดสอบอคติของโมเดล AI</h1>
+      <div class="sub">ถามคำถามเดียวกันโดยเปลี่ยนแค่กลุ่มของคน แล้วดูว่าโมเดลเลือกต่างกันไหม · ผลทั้งหมดเป็นแบบสำรวจ (exploratory)</div>
+    </div>
+    <div class="chips" id="status_chips"></div>
   </div>
 
-  <!-- ============================ RUN VIEW ============================ -->
-  <div id="view_run" class="grid">
-    <div class="stack">
-      <section class="card">
-        <div class="row between" style="margin-top:0">
-          <h2 style="margin:0">โมเดลใน config</h2>
-          <button class="ghost small" id="go_models">+ เพิ่มโมเดล</button>
-        </div>
-        <div id="models" class="models muted" style="margin-top:8px">กำลังโหลด…</div>
-      </section>
+  <nav class="steps" id="steps">
+    <button data-step="1"><span class="n">1</span>เลือกโมเดล</button>
+    <button data-step="2"><span class="n">2</span>ชุดคำถาม</button>
+    <button data-step="3"><span class="n">3</span>รัน</button>
+    <button data-step="4"><span class="n">4</span>ตรวจโดยคน</button>
+    <button data-step="5"><span class="n">5</span>สรุป & เทียบ</button>
+    <button data-step="adv" class="adv"><span class="n">⚙</span>ขั้นสูง</button>
+  </nav>
 
-      <section class="card">
-        <div class="tabs" id="tabs">
-          <button data-cmd="run" class="on">รัน</button>
-          <button data-cmd="score">Score</button>
-          <button data-cmd="summary">Summary</button>
-          <button data-cmd="show">ดูคำตอบ</button>
-          <button data-cmd="export-csv">Export CSV</button>
-          <button data-cmd="repro-check">Repro</button>
-          <button data-cmd="selftest">Selftest</button>
-        </div>
-
-        <form id="form" autocomplete="off">
-          <div data-for="run score summary show export-csv">
-            <label for="run_id">Run id</label>
-            <input type="text" id="run_id" placeholder="เช่น v3-or-ctrl-001" list="run_ids">
-            <datalist id="run_ids"></datalist>
-          </div>
-          <div data-for="run repro-check">
-            <label for="prompts">ไฟล์ prompt</label>
-            <select id="prompts"></select>
-          </div>
-          <div data-for="run">
-            <label>โมเดลที่จะรัน</label>
-            <div id="model_checks"></div>
-            <label for="samples">Samples ต่อ prompt ต่อโมเดล</label>
-            <input type="number" id="samples" min="1" max="20" value="1">
-          </div>
-          <div data-for="show repro-check">
-            <label for="model_one">โมเดล</label>
-            <select id="model_one"></select>
-            <label for="prompt_id">Prompt id <span class="muted">(ไม่ใส่ = ทั้งหมด / ข้อแรก)</span></label>
-            <input type="text" id="prompt_id" placeholder="เช่น CTRL_fr_license">
-          </div>
-          <div data-for="repro-check">
-            <label for="repeats">จำนวนครั้งที่เรียกซ้ำ</label>
-            <input type="number" id="repeats" min="2" max="5" value="2">
-          </div>
-          <div data-for="score">
-            <label for="labels">ไฟล์ label CSV เพิ่มเติม <span class="muted">(ไม่บังคับ — ป้ายจากแท็บติดป้ายใช้อัตโนมัติ)</span></label>
-            <select id="labels"></select>
-          </div>
-          <div data-for="run score summary show export-csv">
-            <div class="check"><input type="checkbox" id="dry_run"><label for="dry_run">Dry run (โมเดลจำลอง, ไม่เสียเงิน, ใช้ bias_poc_dry.db)</label></div>
-          </div>
-          <p class="hint" id="cmd_hint"></p>
-          <div id="estimate" class="box" hidden></div>
-          <div class="row">
-            <button type="submit" id="go">เริ่ม</button>
-          </div>
-        </form>
-      </section>
+  <!-- ======================= STEP 1: MODELS ======================= -->
+  <section class="card" data-panel="1">
+    <h2>① เลือกโมเดลที่จะทดสอบ</h2>
+    <p class="sub">ครั้งแรกแนะนำให้เริ่มจาก <b>โมเดลฟรี 1 ตัว</b> เพื่อดูการทำงานทั้งหมดก่อน แล้วค่อยเพิ่มโมเดลอื่นมาเทียบ</p>
+    <div class="choices two" id="model_cards"></div>
+    <div class="row between">
+      <button class="ghost" id="open_catalog">+ เพิ่มโมเดลจาก OpenRouter</button>
+      <button id="to2">ถัดไป: เลือกชุดคำถาม →</button>
     </div>
 
-    <div class="stack">
-      <section class="card">
-        <div class="row between" style="margin-top:0">
-          <h2 style="margin:0">ผลลัพธ์</h2>
-          <div class="row" style="margin-top:0">
-            <span id="job_status" class="pill muted">ว่าง</span>
-            <button class="danger" id="stop" disabled>หยุด</button>
+    <div id="catalog" hidden>
+      <h3>เพิ่มโมเดลจาก OpenRouter</h3>
+      <div class="grid2">
+        <div>
+          <div class="vchips" id="vchips"></div>
+          <input type="search" id="q" placeholder="ค้นหา เช่น qwen, gemma, claude, llama, gpt">
+          <div class="row" style="margin-top:8px">
+            <select id="sort" style="width:auto">
+              <option value="new">ใหม่ก่อน</option><option value="price">ราคาถูกก่อน</option>
+              <option value="name">ชื่อ A-Z</option><option value="ctx">context ยาวก่อน</option>
+            </select>
+            <label style="display:flex;gap:6px;align-items:center;margin:0;color:var(--ink)"><input type="checkbox" id="f_free">ฟรีเท่านั้น</label>
+            <label style="display:flex;gap:6px;align-items:center;margin:0;color:var(--ink)"><input type="checkbox" id="f_seed">รองรับ seed</label>
           </div>
+          <p class="hint" id="cat_info">กำลังโหลด…</p>
+          <div class="catlist scroll"><table>
+            <thead><tr><th>โมเดล</th><th class="num">เข้า $/M</th><th class="num">ออก $/M</th></tr></thead>
+            <tbody id="cat_rows"></tbody></table></div>
+          <label for="manual_id">หรือพิมพ์ model id เอง</label>
+          <div class="row" style="margin-top:0"><input type="text" id="manual_id" placeholder="เช่น qwen/qwen3.5-9b" style="flex:1"><button class="ghost" id="manual_go">โหลด</button></div>
         </div>
-        <p class="cmdline" id="job_cmd"></p>
-        <pre id="out"></pre>
-      </section>
-
-      <section class="card">
-        <div class="row between" style="margin-top:0">
-          <h2 style="margin:0">Runs ในฐานข้อมูล</h2>
-          <button class="ghost" id="refresh">รีเฟรช</button>
-        </div>
-        <div class="scroll"><table>
-          <thead><tr><th>Run id</th><th>DB</th><th>โมเดล: ok / error</th><th></th></tr></thead>
-          <tbody id="runs"></tbody>
-        </table></div>
-        <div id="csvs" class="hint"></div>
-      </section>
+        <div id="detail_body" class="muted">เลือกโมเดลจากรายการ</div>
+      </div>
     </div>
-  </div>
+  </section>
 
-  <!-- ============================ LABEL VIEW ============================ -->
-  <div id="view_label" hidden>
-    <section class="card">
-      <div class="lbar">
-        <div><label for="l_run">Run</label><select id="l_run"></select></div>
-        <div><label for="l_mode">แสดง</label>
-          <select id="l_mode"><option value="todo">ข้อที่ยังไม่ติดป้ายก่อน</option><option value="all">ทุกข้อตามลำดับ</option></select></div>
-        <div class="check" style="margin-top:26px"><input type="checkbox" id="l_blind" checked><label for="l_blind">โหมดปิดตา (ซ่อนชื่อโมเดลและคำใบ้)</label></div>
-      </div>
-      <div class="progress"><div id="l_bar"></div></div>
-      <p class="hint" id="l_info">เลือก run เพื่อเริ่ม ติดป้ายเฉพาะข้อสอบควบคุมแบบถามตรง (ข้อ A/B ระบบตรวจเองได้)</p>
-    </section>
+  <!-- ======================= STEP 2: QUESTION SET ======================= -->
+  <section class="card" data-panel="2" hidden>
+    <h2>② เลือกชุดคำถาม</h2>
+    <p class="sub">ทุกชุดมี <b>ข้อสอบควบคุม</b> (คำถามง่ายที่มีเฉลย ใช้เช็คว่าโมเดลเข้าใจภาษาไทย) ปนอยู่ด้วย</p>
+    <div class="choices three" id="qset_cards"></div>
+    <details id="opts">
+      <summary>ตัวเลือกเพิ่มเติม</summary>
+      <label for="samples">จำนวนครั้งที่ถามซ้ำต่อข้อ (samples)</label>
+      <select id="samples" style="max-width:320px">
+        <option value="1">1 ครั้ง (เร็ว เหมาะกับชุดทดลอง)</option>
+        <option value="3">3 ครั้ง (แนะนำสำหรับชุดเต็ม)</option>
+        <option value="5">5 ครั้ง</option>
+      </select>
+      <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:12px"><input type="checkbox" id="dry_run">
+        Dry run — ใช้โมเดลจำลอง ไม่เรียก API จริง (ไว้ลองระบบ ข้อมูลแยกไฟล์)</label>
+    </details>
+    <div class="row between">
+      <button class="ghost" data-go="1">← กลับ</button>
+      <button id="to3">ถัดไป: รัน →</button>
+    </div>
+  </section>
 
-    <section class="card" id="l_card" hidden style="margin-top:16px">
-      <div class="row between" style="margin-top:0">
-        <b id="l_pos"></b>
-        <span id="l_who" class="muted"></span>
-      </div>
-      <div class="qa"><div class="qlabel">คำถามที่ส่งให้โมเดล</div><div id="l_q" class="qtext"></div></div>
-      <div class="qa expected"><div class="qlabel">เฉลย (expected_answer)</div><div id="l_exp" class="qtext"></div></div>
-      <div class="qa"><div class="qlabel">คำตอบของโมเดล (เต็ม)</div><div id="l_resp" class="qtext resp"></div></div>
-      <div class="row">
-        <button class="okbtn" id="l_y">✓ ถูก <span class="kbd">Y</span></button>
-        <button class="badbtn" id="l_n">✗ ผิด <span class="kbd">N</span></button>
-        <button class="ghost" id="l_prev">← ก่อนหน้า</button>
-        <button class="ghost" id="l_next">ข้าม →</button>
-        <span id="l_cur" class="pill muted">ยังไม่ติดป้าย</span>
-        <button class="ghost small" id="l_clear" hidden>ล้างป้าย</button>
-      </div>
-      <label for="l_note">บันทึก (ไม่บังคับ — บันทึกอัตโนมัติเมื่อออกจากช่อง)</label>
-      <textarea id="l_note" rows="2" placeholder="เช่น ตอบถูก แต่แต่งรายละเอียดผิด"></textarea>
-      <div class="row">
-        <button class="ghost small" id="l_hist_btn">ดูประวัติป้ายของข้อนี้</button>
-        <span class="hint" id="l_msg"></span>
-      </div>
-      <div id="l_hist" class="hint" hidden></div>
-    </section>
+  <!-- ======================= STEP 3: RUN ======================= -->
+  <section class="card" data-panel="3" hidden>
+    <h2>③ รันทดสอบ</h2>
+    <div class="recap" id="recap"></div>
+    <label for="run_id">ชื่อ run (ตั้งให้อัตโนมัติ แก้ได้)</label>
+    <input type="text" id="run_id" list="run_ids" style="max-width:420px">
+    <datalist id="run_ids"></datalist>
+    <div id="run_warn"></div>
+    <div class="row">
+      <button class="big" id="go">▶ เริ่มรัน</button>
+      <button class="danger" id="stop" hidden>หยุด</button>
+      <span id="job_status" class="pill muted">ว่าง</span>
+    </div>
+    <div class="progress" id="prog"><div></div></div>
+    <p class="hint" id="prog_txt"></p>
+    <div id="run_done" hidden class="note ok"></div>
+    <details id="logbox"><summary>ดูรายละเอียดการทำงาน (log)</summary>
+      <p class="mono muted" id="job_cmd"></p><pre class="log" id="out"></pre></details>
+    <div class="row"><button class="ghost" data-go="2">← กลับ</button></div>
+  </section>
 
-    <section class="card" id="l_done" hidden style="margin-top:16px">
-      <b>ติดป้ายครบทุกข้อแล้ว</b>
-      <p class="hint">score จะใช้ป้ายเหล่านี้อัตโนมัติ ไม่ต้องเลือกไฟล์ CSV</p>
-      <div class="row"><button id="l_score">Score ด้วยป้ายนี้</button><button class="ghost" id="l_review">ทบทวนทุกข้ออีกครั้ง</button></div>
-    </section>
-  </div>
+  <!-- ======================= STEP 4: HUMAN REVIEW ======================= -->
+  <section class="card" data-panel="4" hidden>
+    <h2>④ งานที่ต้องให้คนตรวจ / ยืนยัน</h2>
+    <label for="r4">Run</label>
+    <select id="r4" style="max-width:520px"></select>
+    <ul class="todo" id="todo"></ul>
 
-  <!-- ============================ MODELS VIEW ============================ -->
-  <div id="view_models" class="grid wide" hidden>
-    <section class="card">
-      <h2>ค้นหาโมเดลจาก OpenRouter</h2>
-      <div class="chips" id="chips"></div>
-      <input type="search" id="q" placeholder="พิมพ์ค้นหา เช่น qwen, gemma, claude, llama, gpt">
-      <div class="filters">
-        <select id="sort">
-          <option value="new">ใหม่ก่อน</option>
-          <option value="price">ราคาถูกก่อน</option>
-          <option value="name">ชื่อ A-Z</option>
-          <option value="ctx">context ยาวก่อน</option>
-        </select>
-        <div class="check"><input type="checkbox" id="f_free"><label for="f_free">ฟรีเท่านั้น</label></div>
-        <div class="check"><input type="checkbox" id="f_seed"><label for="f_seed">รองรับ seed</label></div>
+    <div id="label_area" hidden>
+      <h3>ติดป้ายข้อสอบควบคุมแบบถามตรง</h3>
+      <p class="sub">อ่าน คำถาม → เฉลย → คำตอบของโมเดล แล้วตัดสินว่าคำตอบ<b>ถูกตามเฉลย</b>หรือไม่ (ดูที่ความหมาย ไม่ต้องสะกดตรงเป๊ะ)</p>
+      <div class="row" style="margin-top:6px">
+        <label style="display:flex;gap:6px;align-items:center;margin:0;color:var(--ink)"><input type="checkbox" id="l_blind" checked>โหมดปิดตา (ซ่อนชื่อโมเดล)</label>
+        <select id="l_mode" style="width:auto"><option value="todo">ข้อที่ยังไม่ติดป้ายก่อน</option><option value="all">ทุกข้อตามลำดับ</option></select>
       </div>
-      <p class="hint" id="cat_info">กำลังโหลดรายการ…</p>
-      <div class="list scroll"><table>
-        <thead><tr><th>โมเดล</th><th class="num">เข้า $/M</th><th class="num">ออก $/M</th><th class="num">context</th></tr></thead>
-        <tbody id="cat_rows"></tbody>
-      </table></div>
-      <label for="manual_id">หรือพิมพ์ model id เอง <span class="muted">(รูป ผู้พัฒนา/ชื่อรุ่น)</span></label>
-      <div class="row" style="margin-top:0">
-        <input type="text" id="manual_id" placeholder="เช่น qwen/qwen3.5-9b" style="flex:1">
-        <button class="ghost" id="manual_go">โหลด</button>
+      <div class="lprog"><div id="l_bar"></div></div>
+      <p class="hint" id="l_info"></p>
+      <div id="l_card" hidden>
+        <div class="row between" style="margin-top:6px"><b id="l_pos"></b><span id="l_who" class="muted"></span></div>
+        <div class="qa"><div class="qlabel">คำถามที่ส่งให้โมเดล</div><div id="l_q" class="qtext"></div></div>
+        <div class="qa expected"><div class="qlabel">เฉลย</div><div id="l_exp" class="qtext"></div></div>
+        <div class="qa"><div class="qlabel">คำตอบของโมเดล</div><div id="l_resp" class="qtext resp"></div></div>
+        <div class="row">
+          <button class="okbtn" id="l_y">✓ ถูก <span class="kbd">Y</span></button>
+          <button class="badbtn" id="l_n">✗ ผิด <span class="kbd">N</span></button>
+          <button class="ghost" id="l_prev">← ก่อนหน้า</button>
+          <button class="ghost" id="l_next">ข้าม →</button>
+          <span id="l_cur" class="pill muted"></span>
+          <button class="ghost small" id="l_clear" hidden>ล้างป้าย</button>
+        </div>
+        <label for="l_note">บันทึก (ไม่บังคับ บันทึกเองเมื่อออกจากช่อง)</label>
+        <textarea id="l_note" rows="2" placeholder="เช่น ตอบถูก แต่แต่งรายละเอียดผิด"></textarea>
+        <div class="row"><button class="ghost small" id="l_hist_btn">ประวัติป้าย</button><span class="hint" id="l_msg"></span></div>
+        <div id="l_hist" class="hint" hidden></div>
       </div>
-    </section>
+    </div>
+    <div class="row between"><button class="ghost" data-go="3">← กลับ</button><button id="to5">ถัดไป: ดูสรุปผล →</button></div>
+  </section>
 
-    <section class="card" id="detail">
-      <h2>ตั้งค่าโมเดล</h2>
-      <div id="detail_body" class="muted">เลือกโมเดลจากรายการทางซ้าย</div>
-    </section>
-  </div>
+  <!-- ======================= STEP 5: SUMMARY & COMPARE ======================= -->
+  <section class="card" data-panel="5" hidden>
+    <h2>⑤ สรุปผล & เทียบกับโมเดลอื่น</h2>
+    <label for="r5">Run</label>
+    <select id="r5" style="max-width:520px"></select>
+    <div id="sum_head"></div>
+    <div class="mcards" id="sum_models"></div>
+
+    <h3>เทียบกับโมเดลอื่นที่รันชุดคำถามเดียวกัน (รายมิติ)</h3>
+    <p class="sub">แต่ละแถวคือการเปรียบเทียบ 2 กลุ่ม ตัวเลขคือ % ที่โมเดลเลือกกลุ่มแรก — <b>50% = เลือกเท่าๆ กัน (ไม่เอนเอียง)</b>
+      แถบสีคือช่วงความเชื่อมั่น 95% ถ้าแถบคร่อมเส้นกลาง แปลว่ายังไม่พบการเอนเอียงที่ชัดเจน · <b>ไม่มีอันดับรวม</b> เพราะแต่ละมิติวัดคนละเรื่อง</p>
+    <div id="cmp_warn"></div>
+    <div class="scroll"><table id="cmp"></table></div>
+    <div class="legend">
+      <span><span class="tag g">เอนน้อยสุด</span> เอนน้อยกว่าทุกโมเดลอย่างชัดเจน</span>
+      <span><span class="tag b">เอนมากสุด</span> เอนมากกว่าทุกโมเดลอย่างชัดเจน</span>
+      <span><span class="tag">ใกล้เคียง</span> แยกไม่ออกจากโมเดลอื่น</span>
+      <span><span class="tag w">ห้ามตีความ</span> ไม่ผ่านข้อสอบควบคุม</span>
+    </div>
+    <div class="row"><button class="ghost" data-go="4">← กลับ</button></div>
+  </section>
+
+  <!-- ======================= ADVANCED ======================= -->
+  <section class="card" data-panel="adv" hidden>
+    <h2>⚙ ขั้นสูง</h2>
+    <p class="sub">คำสั่งเดิมของ spike.py สำหรับตรวจละเอียด ทุกปุ่มเท่ากับรันคำสั่งเดียวกับ CLI</p>
+    <h3>Runs ทั้งหมด</h3>
+    <div class="scroll"><table>
+      <thead><tr><th>Run</th><th>ชุดคำถาม / DB</th><th>โมเดล: สำเร็จ / ล้มเหลว</th><th></th></tr></thead>
+      <tbody id="runs"></tbody></table></div>
+    <div id="csvs" class="hint"></div>
+    <h3>คำสั่ง</h3>
+    <div class="row" style="margin-top:0">
+      <select id="a_cmd" style="width:auto">
+        <option value="score">score — เกณฑ์ข้อสอบควบคุม</option>
+        <option value="summary">summary — เวลา/ error</option>
+        <option value="show">show — อ่านคำตอบดิบ</option>
+        <option value="export-csv">export-csv — ส่งออก CSV</option>
+        <option value="repro-check">repro-check — ถามซ้ำด้วย seed เดิม (เสียเงิน)</option>
+        <option value="selftest">selftest — ทดสอบตัวอ่านคำตอบ</option>
+      </select>
+      <select id="a_run" style="width:auto"></select>
+      <select id="a_model" style="width:auto"></select>
+      <input type="text" id="a_prompt" placeholder="prompt id (ไม่บังคับ)" style="width:220px">
+      <button id="a_go">รัน</button>
+    </div>
+    <p class="mono muted" id="a_cmdline"></p>
+    <pre class="log" id="a_out"></pre>
+  </section>
 </main>
 
 <script>
 const TOKEN = "__TOKEN__";
-let S = null;                 // last /api/state
-let cmd = "run";              // selected command tab
-let outLen = 0;               // chars of job output already shown
-let polling = null;
-const SEL = new Set();        // model keys ticked in the run form (kept across refreshes)
-let CAT = {loaded: false, scope: "featured"};    // catalog view state (scope: featured | all | v:<slug>)
-let D = null;                 // model shown in the detail panel: {id, name, endpoints}
-let VIEW = "run";
-let L = null;                 // label view: {db, run_id, field, items, i}
-let LSEEN = new Set();        // blind mode: items whose model name the user chose to reveal
-
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const price = (x) => x == null ? "?" : x === 0 ? "ฟรี" : "$" + (x < 0.01 ? x.toFixed(4) : x < 1 ? x.toFixed(3) : x.toFixed(2));
-const usd = (x) => x == null ? "?" : x < 0.01 ? "<$0.01" : "$" + x.toFixed(2);
-const ctxTxt = (c) => c ? (c >= 1e6 ? (c / 1e6).toFixed(1) + "M" : Math.round(c / 1000) + "k") : "?";
+const usd = (x) => x == null ? "?" : x === 0 ? "ฟรี ($0)" : x < 0.01 ? "<$0.01" : "$" + x.toFixed(2);
+const pct = (x) => x == null ? "–" : Math.round(x * 100) + "%";
+const store = {get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+               set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
+
+let S = null;          // /api/state
+let STEP = "1";
+let SEL = null;        // Set of ticked model keys
+let QSET = null;       // selected question-set file
+let CUR = null;        // "db|run_id" of the run being reviewed/summarised
+let outLen = 0, polling = null, lastJob = null;
 
 async function api(path, body) {
   const opt = {headers: {"X-Token": TOKEN}};
-  if (body !== undefined) {
-    opt.method = "POST";
-    opt.headers["Content-Type"] = "application/json";
-    opt.body = JSON.stringify(body);
-  }
+  if (body !== undefined) { opt.method = "POST"; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
   return j;
 }
+const splitRun = (v) => v ? [v.slice(0, v.indexOf("|")), v.slice(v.indexOf("|") + 1)] : [null, null];
 
-/* ------------------------------- views ------------------------------- */
-function setView(v) {
-  $("view_run").hidden = v !== "run";
-  $("view_models").hidden = v !== "models";
-  $("view_label").hidden = v !== "label";
-  VIEW = v;
-  if (v === "label") fillLabelRuns();
-  document.querySelectorAll("#nav button").forEach(b => b.className = b.dataset.view === v ? "" : "ghost");
-  if (v === "models" && !CAT.loaded) loadCatalog();
+/* ----------------------------- navigation ----------------------------- */
+function go(step) {
+  STEP = String(step);
+  document.querySelectorAll("[data-panel]").forEach(p => p.hidden = p.dataset.panel !== STEP);
+  document.querySelectorAll("#steps button").forEach(b => b.classList.toggle("on", b.dataset.step === STEP));
+  if (STEP === "3") renderRecap();
+  if (STEP === "4") { fillRunSelect("r4"); loadReview(); }
+  if (STEP === "5") { fillRunSelect("r5"); loadSummary(); }
+  if (STEP === "adv") renderAdvanced();
+  window.scrollTo({top: 0, behavior: "smooth"});
+}
+function markDone() {
+  const done = {"1": SEL && SEL.size > 0, "2": !!QSET, "3": !!CUR};
+  document.querySelectorAll("#steps button").forEach(b => b.classList.toggle("done", !!done[b.dataset.step]));
 }
 
-/* ------------------------------- run view ------------------------------- */
+/* ----------------------------- state ----------------------------- */
+async function refresh() {
+  S = await api("/api/state");
+  if (!SEL) {   // first load: default models from the config (a free model), else nothing
+    SEL = new Set((S.default_models || []).filter(k => S.models.some(m => m.key === k)));
+  }
+  for (const k of [...SEL]) if (!S.models.some(m => m.key === k)) SEL.delete(k);
+  if (!QSET) QSET = S.prompt_files.some(f => f.name === "prompts_v3_mini.jsonl") ? "prompts_v3_mini.jsonl" : (S.prompt_files[0] || {}).name;
+  if (!CUR) { const last = store.get("bias_last_run"); if (last && S.runs.some(r => r.db + "|" + r.run_id === last)) CUR = last; }
+  renderStatus(); renderModels(); renderQsets(); markDone();
+  if (STEP === "3") renderRecap();
+  if (STEP === "adv") renderAdvanced();
+}
+
+function renderStatus() {
+  const keyOk = S.models.length && S.models.every(m => m.key_set);
+  const j = S.job;
+  $("status_chips").innerHTML =
+    `<span class="pill ${keyOk ? "ok" : "bad"}">${keyOk ? "API key พร้อม" : "API key ยังไม่ได้ตั้ง"}</span>` +
+    (j.running ? `<span class="pill warn">กำลังรันงาน…</span>` : "");
+}
+
+/* ----------------------------- step 1 ----------------------------- */
 function renderModels() {
-  $("models").innerHTML = S.models.length ? S.models.map(m =>
-    `<div class="m"><b>${esc(m.key)}</b> <span class="muted">${esc(m.model)}</span>
-     ${m.price_in != null ? `<span class="muted"> · ${price(m.price_in)} / ${price(m.price_out)} ต่อล้าน token</span>` : ""}<br>
-     ${m.key_set ? `<span class="pill ok">${esc(m.api_key_env)} ตั้งแล้ว</span>`
-                 : `<span class="pill bad">${esc(m.api_key_env || "ไม่มี api_key_env")} ยังไม่ได้ตั้ง</span>`}
-     ${m.removable ? `<button class="ghost small" data-remove="${esc(m.key)}">ลบ</button>` : ""}</div>`
-  ).join("") : `<span class="bad">อ่าน config ไม่ได้ หรือยังไม่มีโมเดล</span>`;
+  $("model_cards").innerHTML = S.models.map(m => {
+    const free = m.price_in === 0 && m.price_out === 0;
+    return `<label class="choice"><input type="checkbox" name="mk" value="${esc(m.key)}" ${SEL.has(m.key) ? "checked" : ""}>
+      <div class="t">${esc(m.key)}</div><div class="d mono">${esc(m.model)}</div>
+      <div class="meta">${free ? '<span class="tag g">ฟรี</span>' : m.price_in != null ? `<span class="tag">${price(m.price_in)} / ${price(m.price_out)} ต่อล้าน token</span>` : ""}
+      ${m.key_set ? "" : '<span class="tag b">ไม่มี API key</span>'}
+      ${m.removable ? `<button class="ghost small" data-remove="${esc(m.key)}">ลบ</button>` : ""}</div></label>`;
+  }).join("") || `<p class="muted">ยังไม่มีโมเดล กด "+ เพิ่มโมเดล"</p>`;
 }
+$("model_cards").addEventListener("change", () => {
+  SEL = new Set([...document.querySelectorAll('input[name=mk]:checked')].map(x => x.value)); markDone();
+});
+$("model_cards").addEventListener("click", async e => {
+  const k = e.target.dataset.remove; if (!k) return;
+  e.preventDefault();
+  if (!confirm(`ลบ ${k} ออกจาก config?\nผลของ run เก่ายังอยู่`)) return;
+  try { await api("/api/models/remove", {key: k}); SEL.delete(k); await refresh(); } catch (err) { alert(err.message); }
+});
+$("to2").addEventListener("click", () => { if (!SEL.size) return alert("เลือกอย่างน้อย 1 โมเดล"); go(2); });
 
-let selInit = false;
-function renderModelChecks() {
-  if (!selInit) {   // first load: tick the core models (not the ones added here), as before
-    S.models.filter(m => !m.removable).forEach(m => SEL.add(m.key));
-    selInit = true;
-  }
-  for (const k of [...SEL]) if (!S.models.some(m => m.key === k)) SEL.delete(k);   // removed models
-  $("model_checks").innerHTML = S.models.length ? S.models.map(m =>
-    `<div class="check"><input type="checkbox" name="mk" value="${esc(m.key)}" id="mk_${esc(m.key)}" ${SEL.has(m.key) ? "checked" : ""}>
-     <label for="mk_${esc(m.key)}">${esc(m.key)} <span class="muted">${m.price_in != null ? price(m.price_in) + " / " + price(m.price_out) : ""}</span></label></div>`
-  ).join("") : `<span class="muted">ยังไม่มีโมเดล — กด "+ เพิ่มโมเดล"</span>`;
+/* ----------------------------- step 2 ----------------------------- */
+function renderQsets() {
+  const known = ["prompts_v3_mini.jsonl", "controls_only.jsonl", "prompts_v3.jsonl"];
+  const files = [...S.prompt_files].sort((a, b) => (known.indexOf(a.name) + 1 || 99) - (known.indexOf(b.name) + 1 || 99));
+  $("qset_cards").innerHTML = files.map(f => `<label class="choice"><input type="radio" name="qs" value="${esc(f.name)}" ${f.name === QSET ? "checked" : ""}>
+    <div class="t">${esc(f.label || f.name)} <span class="muted" style="font-weight:400">· ${f.count} ข้อ</span></div>
+    <div class="d">${esc(f.desc || "ไฟล์คำถามอื่น")}</div>
+    <div class="meta">${f.name === "prompts_v3_mini.jsonl" ? '<span class="tag g">แนะนำสำหรับครั้งแรก</span>' : ""}<span class="tag mono">${esc(f.name)}</span></div></label>`).join("");
 }
+$("qset_cards").addEventListener("change", () => {
+  QSET = (document.querySelector('input[name=qs]:checked') || {}).value;
+  $("samples").value = QSET === "prompts_v3.jsonl" ? "3" : "1"; markDone();
+});
+$("to3").addEventListener("click", () => { if (!QSET) return alert("เลือกชุดคำถาม"); go(3); });
 
-function renderState() {
-  renderModels();
-  renderModelChecks();
-  const keep = (id) => $(id).value;
-  const pv = keep("prompts"), mv = keep("model_one"), lv = keep("labels");
-  $("prompts").innerHTML = S.prompt_files.map(f =>
-    `<option value="${esc(f.name)}">${esc(f.name)} (${f.count} ข้อ)</option>`).join("");
-  if (pv) $("prompts").value = pv;
-  else if (S.prompt_files.some(f => f.name === "controls_only.jsonl")) $("prompts").value = "controls_only.jsonl";
-  $("model_one").innerHTML = S.models.map(m => `<option>${esc(m.key)}</option>`).join("");
-  if (cmd === "show") $("model_one").insertAdjacentHTML("afterbegin", `<option value="">(ทุกโมเดล)</option>`);
-  if (mv) $("model_one").value = mv;
-  $("labels").innerHTML = `<option value="">(ไม่ใช้ — ใช้ป้ายในฐานข้อมูล)</option>` +
-    S.label_csvs.map(f => `<option>${esc(f)}</option>`).join("");
-  if (lv) $("labels").value = lv;
-
+/* ----------------------------- step 3 ----------------------------- */
+function autoRunId() {
+  const set = {"prompts_v3_mini.jsonl": "mini", "controls_only.jsonl": "ctrl", "prompts_v3.jsonl": "full"}[QSET] || "custom";
+  const m = [...SEL].length === 1 ? [...SEL][0] : `${SEL.size}models`;
+  const d = new Date(), p2 = (n) => String(n).padStart(2, "0");
+  return `${set}-${m}-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}`.slice(0, 64);
+}
+let estSeq = 0;
+async function renderRecap() {
+  const f = S.prompt_files.find(x => x.name === QSET) || {count: 0};
+  const samples = parseInt($("samples").value) || 1;
+  const calls = f.count * samples * SEL.size;
+  if (!$("run_id").value || $("run_id").dataset.auto === "1") { $("run_id").value = autoRunId(); $("run_id").dataset.auto = "1"; }
   $("run_ids").innerHTML = S.runs.map(r => `<option value="${esc(r.run_id)}">`).join("");
-  $("runs").innerHTML = S.runs.length ? S.runs.map(r => {
-    const models = Object.entries(r.models).map(([k, st]) =>
-      `${esc(k)}: <span class="ok">${st.ok || 0}</span> / <span class="${(st.error||0) ? "bad" : "muted"}">${st.error || 0}</span>`).join("<br>");
-    const b = (c, t) => `<button class="ghost" data-quick="${c}" data-run="${esc(r.run_id)}" data-dry="${r.db === "dry"}">${t}</button>`;
-    return `<tr><td><b>${esc(r.run_id)}</b><br><span class="muted">${esc((r.created_at||"").slice(0,16).replace("T"," "))}</span></td>
-      <td>${r.db === "dry" ? '<span class="pill warn">dry</span>' : '<span class="pill ok">จริง</span>'}</td>
-      <td>${models || '<span class="muted">-</span>'}</td>
-      <td class="actions">${b("score","Score")} ${b("summary","Summary")} ${b("export-csv","CSV")} <button class="ghost" data-label="${r.db}|${esc(r.run_id)}">ติดป้าย</button></td></tr>`;
-  }).join("") : `<tr><td colspan="4" class="muted">ยังไม่มี run</td></tr>`;
-
-  if (VIEW === "label") fillLabelRuns();
-  $("csvs").innerHTML = S.label_csvs.length
-    ? "ดาวน์โหลด CSV: " + S.label_csvs.map(f => `<a href="/download?file=${encodeURIComponent(f)}">${esc(f)}</a>`).join(" · ")
-    : "";
-  updateHint();
-}
-
-function setTab(c) {
-  cmd = c;
-  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.cmd === c));
-  document.querySelectorAll("[data-for]").forEach(el => el.hidden = !el.dataset.for.split(" ").includes(c));
-  if (S) renderState();
-}
-
-function selectedKeys() { return [...document.querySelectorAll('input[name=mk]:checked')].map(x => x.value); }
-
-function plannedCalls() {
-  const f = S.prompt_files.find(p => p.name === $("prompts").value);
-  return (f ? f.count : 0) * (parseInt($("samples").value) || 1) * selectedKeys().length;
-}
-
-let estTimer = null, estSeq = 0;
-function updateHint() {
-  let t = "";
-  $("estimate").hidden = true;
-  if (cmd === "run" && S) {
-    const n = plannedCalls();
-    t = $("dry_run").checked ? `สูงสุด ${n} calls (โมเดลจำลอง ไม่เสียเงิน)`
-      : `สูงสุด ${n} API calls ที่เสียเงินจริง (ข้อที่ทำเสร็จแล้วใน run id เดิมจะข้าม) · run id เดิมต้องใช้โมเดลชุดเดียวกับที่เคยรัน ไม่งั้น spike.py จะไม่ยอมรัน`;
-    if (!$("dry_run").checked && n > 0) { clearTimeout(estTimer); estTimer = setTimeout(refreshEstimate, 250); }
-  } else if (cmd === "repro-check") {
-    t = "เรียก API จริงด้วย prompt และ seed เดิมซ้ำ เพื่อดูว่าได้คำตอบเหมือนเดิมไหม (เสียเงินเล็กน้อย)";
-  } else if (cmd === "export-csv") {
-    t = "ไฟล์จะถูกบันทึกเป็น v3-*.csv ในโฟลเดอร์โปรเจกต์ (อยู่ใน .gitignore) แล้วดาวน์โหลดได้จากด้านขวา";
-  } else if (cmd === "score") {
-    t = "ป้ายจากแท็บ \"ติดป้าย\" ถูกใช้อัตโนมัติ ไฟล์ CSV ด้านบนเป็นตัวเลือกเสริม (ถ้าขัดกับป้ายในฐานข้อมูล score จะหยุดและแจ้ง) ข้อที่ยังไม่มีป้ายจะใช้คำใบ้อัตโนมัติ (PROVISIONAL)";
+  const dry = $("dry_run").checked;
+  $("recap").innerHTML = `<div>โมเดล</div><div>${[...SEL].map(esc).join(", ") || '<span class="bad">ยังไม่ได้เลือก</span>'}</div>
+    <div>ชุดคำถาม</div><div>${esc(f.label || QSET)} · ${f.count} ข้อ × ${samples} ครั้ง</div>
+    <div>จำนวนครั้งที่เรียก</div><div>${calls} ครั้ง${dry ? " (dry run: โมเดลจำลอง)" : ""}</div>
+    <div>ค่าใช้จ่ายโดยประมาณ</div><div id="est">${dry ? "ไม่เสียเงิน" : "กำลังคำนวณ…"}</div>`;
+  const noKey = [...SEL].filter(k => !(S.models.find(m => m.key === k) || {}).key_set);
+  $("run_warn").innerHTML = (!dry && noKey.length) ? `<div class="note bad">โมเดล ${esc(noKey.join(", "))} ไม่มี API key — ปิดเซิร์ฟเวอร์ แล้ว export OPENROUTER_API_KEY ก่อนเปิดใหม่ หรือใช้ Dry run</div>` : "";
+  if (!dry && SEL.size) {
+    const seq = ++estSeq;
+    try {
+      const e = await api("/api/estimate", {models: [...SEL], prompts: QSET, samples});
+      if (seq === estSeq) $("est").textContent = e.worst === 0 ? "ฟรี ($0)" : `${usd(e.typical)} (สูงสุด ${usd(e.worst)})`;
+    } catch (err) { $("est").textContent = "?"; }
   }
-  $("cmd_hint").textContent = t;
 }
-
-function estimateHtml(e) {
-  const rows = e.rows.map(r => `<div>${esc(r.key)}: ${r.calls} calls · ${usd(r.typical)} (สูงสุด ${usd(r.worst)})</div>`).join("");
-  return `<b>ค่าใช้จ่ายโดยประมาณ ${usd(e.typical)}</b> <span class="muted">(ถ้าตอบยาวเต็ม max_tokens ทุกครั้ง สูงสุด ${usd(e.worst)})</span>${rows}` +
-    (e.unknown_price.length ? `<div class="warn">ไม่มีราคาของ ${esc(e.unknown_price.join(", "))} ใน note จึงไม่ได้รวม</div>` : "") +
-    `<div class="muted">ประมาณจากจำนวนตัวอักษร ไม่ใช่ตัวเลขจริง ค่าจริงดูได้ที่หน้า OpenRouter</div>`;
-}
-
-async function refreshEstimate() {
-  const seq = ++estSeq;
-  const keys = selectedKeys();
-  if (cmd !== "run" || $("dry_run").checked || !keys.length) return;
-  try {
-    const e = await api("/api/estimate", {models: keys, prompts: $("prompts").value, samples: parseInt($("samples").value) || 1});
-    if (seq !== estSeq) return;
-    $("estimate").innerHTML = estimateHtml(e); $("estimate").hidden = false;
-  } catch (err) { /* estimate is optional; the run itself validates everything */ }
-}
-
-function collect() {
-  return {
-    command: cmd,
-    run_id: $("run_id").value.trim(),
-    prompts: $("prompts").value,
-    models: selectedKeys(),
-    samples: parseInt($("samples").value) || 1,
-    model: $("model_one").value,
-    prompt: $("prompt_id").value.trim(),
-    repeats: parseInt($("repeats").value) || 2,
-    labels: $("labels").value,
-    dry_run: $("dry_run").checked,
-  };
-}
-
-async function submit(req) {
-  if (req.command === "run") {
-    if (!req.models.length) return alert("เลือกอย่างน้อย 1 โมเดล");
-    const n = plannedCalls();
-    req.max_calls = Math.max(1, n);
-    if (!req.dry_run) {
-      let est = "";
-      try { const e = await api("/api/estimate", {models: req.models, prompts: req.prompts, samples: req.samples});
-            est = `\nประมาณ ${usd(e.typical)} (สูงสุด ${usd(e.worst)})`; } catch (err) {}
-      if (!confirm(`จะเรียก API จริงสูงสุด ${n} ครั้ง ซึ่งมีค่าใช้จ่าย${est}\nrun id: ${req.run_id}\nโมเดล: ${req.models.join(", ")}\nยืนยันไหม?`)) return;
-      req.confirm_cost = true;
-    }
+$("run_id").addEventListener("input", () => { $("run_id").dataset.auto = "0"; });
+$("go").addEventListener("click", async () => {
+  if (!SEL.size) return alert("เลือกโมเดลในขั้นที่ 1 ก่อน");
+  const f = S.prompt_files.find(x => x.name === QSET) || {count: 0};
+  const samples = parseInt($("samples").value) || 1;
+  const req = {command: "run", run_id: $("run_id").value.trim(), prompts: QSET, models: [...SEL],
+               samples, dry_run: $("dry_run").checked, max_calls: Math.max(1, f.count * samples * SEL.size)};
+  if (!req.dry_run) {
+    let est = ""; try { const e = await api("/api/estimate", {models: req.models, prompts: QSET, samples});
+      est = e.worst === 0 ? "\nค่าใช้จ่าย: ฟรี" : `\nค่าใช้จ่ายประมาณ ${usd(e.typical)} (สูงสุด ${usd(e.worst)})`; } catch (e) {}
+    if (!confirm(`เรียก API จริงสูงสุด ${req.max_calls} ครั้ง${est}\nrun: ${req.run_id}\nยืนยันไหม?`)) return;
+    req.confirm_cost = true;
   }
-  if (req.command === "repro-check" && !confirm("repro-check เรียก API จริง (เสียเงินเล็กน้อย) ยืนยันไหม?")) return;
   try {
     await api("/api/job", req);
-    outLen = 0; $("out").textContent = "";
+    CUR = (req.dry_run ? "dry" : "real") + "|" + req.run_id; store.set("bias_last_run", CUR);
+    outLen = 0; $("out").textContent = ""; $("a_out").textContent = ""; $("run_done").hidden = true;
+    $("run_id").dataset.auto = "1";
     startPolling();
   } catch (e) { alert(e.message); }
-}
+});
+$("stop").addEventListener("click", () => api("/api/job/stop", {}).catch(e => alert(e.message)));
+$("dry_run").addEventListener("change", () => { if (STEP === "3") renderRecap(); });
+$("samples").addEventListener("change", () => { if (STEP === "3") renderRecap(); });
 
 async function poll() {
   const j = await api("/api/job?since=" + outLen).catch(() => null);
   if (!j) return;
-  if (j.length < outLen) { outLen = 0; $("out").textContent = ""; return; }  // new job replaced the log
+  if (j.length < outLen) { outLen = 0; $("out").textContent = ""; $("a_out").textContent = ""; return; }
   if (j.output) {
-    const out = $("out");
-    const atBottom = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
-    out.textContent += j.output;
+    for (const el of [$("out"), $("a_out")]) {
+      const bottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+      el.textContent += j.output; if (bottom) el.scrollTop = el.scrollHeight;
+    }
     outLen = j.length;
-    if (atBottom) out.scrollTop = out.scrollHeight;
   }
-  $("job_cmd").textContent = j.argv.length ? "python3 spike.py " + j.argv.join(" ") : "";
+  lastJob = j;
+  const cmdline = j.argv.length ? "python3 spike.py " + j.argv.join(" ") : "";
+  $("job_cmd").textContent = cmdline; $("a_cmdline").textContent = cmdline;
+  const isRun = j.argv[0] === "run";
+  // progress from spike.py lines like "[12/34] model prompt ok"
+  const m = [...$("out").textContent.matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
+  if (isRun) {
+    const k = m ? +m[1] : 0, n = m ? +m[2] : 0;
+    $("prog").querySelector("div").style.width = n ? (100 * k / n) + "%" : (j.running ? "3%" : "0");
+    $("prog_txt").textContent = j.running ? (n ? `กำลังรัน ${k}/${n} …` : "กำลังเริ่ม…") : "";
+  }
   const st = $("job_status");
   if (j.running) { st.className = "pill warn"; st.textContent = "กำลังรัน…"; }
   else if (j.exit_code === null) { st.className = "pill muted"; st.textContent = "ว่าง"; }
   else if (j.exit_code === 0) { st.className = "pill ok"; st.textContent = "เสร็จ"; }
-  // spike.py score exits 3 when a model fails the pre-registered control gate: that is a
-  // result to read, not a crash. Negative codes mean the process was killed (Stop button).
-  else if (j.exit_code === 3 && j.argv[0] === "score") { st.className = "pill warn"; st.textContent = "เสร็จ: มีโมเดลไม่ผ่านเกณฑ์ control (ดูผลด้านล่าง)"; }
-  else if (j.exit_code === 2 && j.argv[0] === "repro-check") { st.className = "pill warn"; st.textContent = "เสร็จ: คำตอบไม่เหมือนกัน (seed ไม่ทำให้ซ้ำได้)"; }
+  else if (j.exit_code === 3 && j.argv[0] === "score") { st.className = "pill warn"; st.textContent = "เสร็จ: มีโมเดลไม่ผ่านเกณฑ์"; }
+  else if (j.exit_code === 2 && j.argv[0] === "repro-check") { st.className = "pill warn"; st.textContent = "เสร็จ: คำตอบไม่เหมือนเดิม"; }
   else if (j.exit_code < 0) { st.className = "pill muted"; st.textContent = "หยุดแล้ว"; }
-  else { st.className = "pill bad"; st.textContent = "จบด้วย exit " + j.exit_code; }
-  $("stop").disabled = !j.running;
-  $("go").disabled = j.running;
+  else { st.className = "pill bad"; st.textContent = "จบด้วย error (exit " + j.exit_code + ")"; }
+  $("stop").hidden = !j.running; $("go").disabled = j.running; $("a_go").disabled = j.running;
+  $("prog").classList.toggle("done", !j.running && j.exit_code === 0 && isRun);
   if (!j.running && polling) {
     clearInterval(polling); polling = null;
-    refresh();  // run counts / new CSVs
+    await refresh();
+    if (isRun) {
+      const ok = /Finished: (\d+) ok, (\d+) failed/.exec($("out").textContent);
+      const failed = ok ? +ok[2] : null;
+      $("run_done").hidden = false;
+      $("run_done").className = "note " + (j.exit_code === 0 ? "ok" : "warn");
+      $("run_done").innerHTML = j.exit_code === 0
+        ? `✓ รันเสร็จ ${ok ? ok[1] + " ข้อ" : ""} · <button class="small" data-go="4">ไปขั้นที่ 4: ดูงานที่ต้องตรวจ →</button>`
+        : (failed ? `รันเสร็จแต่มี ${failed} ครั้งที่ล้มเหลว — กด "เริ่มรัน" อีกครั้งด้วยชื่อ run เดิมเพื่อลองใหม่ หรือไปขั้นที่ 4 <button class="small" data-go="4">ขั้นที่ 4 →</button>`
+                  : `งานจบแบบไม่สำเร็จ — เปิด "ดูรายละเอียด (log)" ด้านล่างเพื่อดูสาเหตุ`);
+      if (j.exit_code !== 0 && !failed) $("logbox").open = true;
+      markDone();
+    }
   }
 }
-
 function startPolling() { if (!polling) polling = setInterval(poll, 700); poll(); }
-async function refresh() { S = await api("/api/state"); renderState(); }
+document.addEventListener("click", e => { const g = e.target.closest("[data-go]"); if (g) go(g.dataset.go); });
 
-/* ------------------------------- label view ------------------------------- */
-function fillLabelRuns() {
-  if (!S) return;
-  const cur = $("l_run").value;
-  $("l_run").innerHTML = `<option value="">— เลือก run —</option>` + S.runs.map(r =>
-    `<option value="${r.db}|${esc(r.run_id)}">${esc(r.run_id)}${r.db === "dry" ? " (dry)" : ""}</option>`).join("");
-  if (cur) $("l_run").value = cur;
+/* ----------------------------- run pickers ----------------------------- */
+function fillRunSelect(id) {
+  const el = $(id);
+  el.innerHTML = S.runs.length ? S.runs.map(r => `<option value="${r.db}|${esc(r.run_id)}">${esc(r.run_id)}${r.db === "dry" ? " (dry run)" : ""} · ${esc((r.created_at || "").slice(0, 16).replace("T", " "))}</option>`).join("")
+    : `<option value="">ยังไม่มี run</option>`;
+  if (CUR && S.runs.some(r => r.db + "|" + r.run_id === CUR)) el.value = CUR;
 }
+$("r4").addEventListener("change", () => { CUR = $("r4").value; store.set("bias_last_run", CUR); loadReview(); });
+$("r5").addEventListener("change", () => { CUR = $("r5").value; store.set("bias_last_run", CUR); loadSummary(); });
+$("to5").addEventListener("click", () => go(5));
 
-async function loadLabels(keepIndex) {
-  const v = $("l_run").value;
-  if (!v) { L = null; $("l_card").hidden = true; $("l_done").hidden = true; return; }
-  const [db, run_id] = [v.slice(0, v.indexOf("|")), v.slice(v.indexOf("|") + 1)];
-  $("l_info").textContent = "กำลังโหลด…";
+/* ----------------------------- step 4 ----------------------------- */
+async function loadReview() {
+  const [db, run_id] = splitRun($("r4").value);
+  if (!run_id) { $("todo").innerHTML = `<li class="info"><span class="ic">i</span><span class="tx">ยังไม่มี run — รันในขั้นที่ 3 ก่อน</span></li>`; $("label_area").hidden = true; return; }
+  try {
+    const s = await api("/api/run/summary?" + new URLSearchParams({db, run_id}));
+    renderTodo(s);
+    const need = s.models.some(m => m.label_need > 0);
+    $("label_area").hidden = !need;
+    if (need) loadLabels(db, run_id);
+  } catch (e) { $("todo").innerHTML = `<li class="must"><span class="ic">!</span><span class="tx">${esc(e.message)}</span></li>`; }
+}
+function renderTodo(s) {
+  const icon = {must: "!", should: "?", info: "i", done: "✓"};
+  const btn = (t) => t.action === "label" ? `<button class="small" data-act="label">ติดป้ายด้านล่าง ↓</button>`
+    : t.action === "rerun" ? `<button class="small" data-act="rerun" data-model="${esc(t.model)}">รันซ้ำ</button>`
+    : t.action === "show" ? `<button class="small ghost" data-act="show" data-model="${esc(t.model)}">เปิดอ่าน</button>` : "";
+  $("todo").innerHTML = s.todo.map(t => `<li class="${t.level}"><span class="ic">${icon[t.level]}</span><span class="tx">${esc(t.text)}</span>${btn(t)}</li>`).join("");
+}
+$("todo").addEventListener("click", async e => {
+  const b = e.target.closest("button[data-act]"); if (!b) return;
+  const [db, run_id] = splitRun($("r4").value);
+  if (b.dataset.act === "label") { $("label_area").scrollIntoView({behavior: "smooth"}); return; }
+  if (b.dataset.act === "show") { go("adv"); $("a_cmd").value = "show"; $("a_run").value = db + "|" + run_id; $("a_model").value = b.dataset.model; return; }
+  if (b.dataset.act === "rerun") {
+    const r = S.runs.find(x => x.db === db && x.run_id === run_id);
+    const models = r ? Object.keys(r.models) : [];
+    if (!confirm(`รันซ้ำ run "${run_id}" เฉพาะข้อที่ยังไม่สำเร็จ${db === "real" ? " (อาจเสียเงินเล็กน้อย)" : ""}?`)) return;
+    const f = [...S.prompt_files];   // the run's question set is inferred by the server summary
+    const s = await api("/api/run/summary?" + new URLSearchParams({db, run_id}));
+    if (!s.question_set) return alert("ไม่รู้ว่า run นี้ใช้ไฟล์คำถามไหน ใช้หน้า ⚙ ขั้นสูง หรือ CLI แทน");
+    const qf = f.find(x => x.name === s.question_set);
+    try {
+      await api("/api/job", {command: "run", run_id, prompts: s.question_set, models, samples: s.n_samples,
+                             dry_run: db === "dry", confirm_cost: true, max_calls: Math.max(1, qf.count * s.n_samples * models.length)});
+      go(3); outLen = 0; $("out").textContent = ""; startPolling();
+    } catch (err) { alert(err.message); }
+  }
+});
+
+/* labelling (same storage and rules as before: append-only labels table) */
+let L = null, LSEEN = new Set();
+async function loadLabels(db, run_id) {
   try {
     const r = await api("/api/label/items?" + new URLSearchParams({db, run_id, task: "control"}));
-    const i = keepIndex && L && L.run_id === run_id ? L.i : 0;
-    L = {db, run_id, field: r.field, items: r.items, i};
-    LSEEN = new Set();
-    if (!L.items.length) {
-      $("l_info").textContent = "run นี้ไม่มีข้อสอบควบคุมแบบถามตรงที่ต้องติดป้าย";
-      $("l_card").hidden = true; $("l_done").hidden = true; updateProgress(); return;
-    }
-    if (!keepIndex && $("l_mode").value === "todo") gotoNext(-1);
+    L = {db, run_id, field: r.field, items: r.items, i: 0}; LSEEN = new Set();
+    if (!L.items.length) { $("l_card").hidden = true; $("l_info").textContent = "ไม่มีข้อที่ต้องติดป้าย"; lprog(); return; }
+    if ($("l_mode").value === "todo") gotoNext(-1);
     renderLabel();
   } catch (e) { $("l_info").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
 }
-
-function labelledCount() { return L ? L.items.filter(x => x.label).length : 0; }
-
-function updateProgress() {
-  const n = L ? L.items.length : 0, k = labelledCount();
+const lDone = () => L ? L.items.filter(x => x.label).length : 0;
+function lprog() {
+  const n = L ? L.items.length : 0, k = lDone();
   $("l_bar").style.width = n ? (100 * k / n) + "%" : "0";
-  if (L && n) $("l_info").textContent = `ติดป้ายแล้ว ${k}/${n} ข้อ · ${L.db === "dry" ? "ฐานข้อมูล dry run" : "ฐานข้อมูลจริง"} · คีย์ลัด Y = ถูก, N = ผิด, ← → = เลื่อน`;
+  $("l_info").textContent = n ? `ติดป้ายแล้ว ${k}/${n} ข้อ${k === n ? " — ครบแล้ว ✓" : ""} · คีย์ลัด Y = ถูก, N = ผิด, ← → = เลื่อน` : "";
 }
-
-// Move to the next item after `from` (wrapping); in "todo" mode prefer unlabelled ones.
 function gotoNext(from) {
   const n = L.items.length;
   if ($("l_mode").value === "todo") {
     for (let s = 1; s <= n; s++) { const j = (from + s + n) % n; if (!L.items[j].label) { L.i = j; return true; } }
-    return false;   // everything is labelled
+    return false;
   }
-  L.i = Math.min(n - 1, from + 1);
-  return true;
+  L.i = Math.min(n - 1, from + 1); return true;
 }
-
 function renderLabel() {
-  updateProgress();
+  lprog();
   const it = L.items[L.i];
-  const allDone = labelledCount() === L.items.length;
-  $("l_done").hidden = !allDone;
   $("l_card").hidden = false;
-  $("l_pos").textContent = `ข้อ ${L.i + 1} / ${L.items.length}  ·  ${it.prompt_id}${it.sample_idx ? " #" + it.sample_idx : ""}`;
-  const blind = $("l_blind").checked;
-  const reveal = !blind || LSEEN.has(it.gen_id);
-  $("l_who").innerHTML = reveal
-    ? `โมเดล: <b>${esc(it.model_key)}</b>${blind ? "" : ` · คำใบ้อัตโนมัติ: ${it.hint === true ? "ถูก" : it.hint === false ? "ผิด" : "-"}`}`
-    : (it.label ? `<button class="ghost small" id="l_reveal">ดูชื่อโมเดล</button>` : `โมเดล: ซ่อนอยู่ (ติดป้ายก่อนถึงดูได้)`);
-  $("l_q").textContent = it.question;
-  $("l_exp").textContent = it.expected ?? "(ไม่มีเฉลย)";
-  $("l_resp").textContent = it.response;
-  $("l_resp").scrollTop = 0;
-  const cur = $("l_cur");
-  cur.className = "pill " + (it.label === "y" ? "ok" : it.label === "n" ? "bad" : "muted");
-  cur.textContent = it.label === "y" ? "ป้ายปัจจุบัน: ถูก" : it.label === "n" ? "ป้ายปัจจุบัน: ผิด" : "ยังไม่ติดป้าย";
-  $("l_clear").hidden = !it.label;
-  $("l_note").value = it.note || "";
-  $("l_hist").hidden = true;
-  $("l_hist_btn").textContent = `ดูประวัติป้ายของข้อนี้ (${it.n_history})`;
-  $("l_prev").disabled = L.i === 0;
-  $("l_msg").textContent = "";
+  $("l_pos").textContent = `ข้อ ${L.i + 1}/${L.items.length} · ${it.prompt_id}${it.sample_idx ? " #" + it.sample_idx : ""}`;
+  const blind = $("l_blind").checked, reveal = !blind || LSEEN.has(it.gen_id);
+  $("l_who").innerHTML = reveal ? `โมเดล: <b>${esc(it.model_key)}</b>`
+    : (it.label ? `<button class="ghost small" id="l_reveal">ดูชื่อโมเดล</button>` : "โมเดล: ซ่อนอยู่");
+  $("l_q").textContent = it.question; $("l_exp").textContent = it.expected ?? "(ไม่มีเฉลย)";
+  $("l_resp").textContent = it.response; $("l_resp").scrollTop = 0;
+  $("l_cur").className = "pill " + (it.label === "y" ? "ok" : it.label === "n" ? "bad" : "muted");
+  $("l_cur").textContent = it.label === "y" ? "ป้ายตอนนี้: ถูก" : it.label === "n" ? "ป้ายตอนนี้: ผิด" : "ยังไม่ติดป้าย";
+  $("l_clear").hidden = !it.label; $("l_note").value = it.note || "";
+  $("l_hist").hidden = true; $("l_hist_btn").textContent = `ประวัติป้าย (${it.n_history})`;
+  $("l_prev").disabled = L.i === 0; $("l_msg").textContent = "";
 }
-
-async function saveLabel(value) {
-  const it = L.items[L.i];
-  try {
-    await saveNote();   // keep a note typed just before pressing Y/N
-    const r = await api("/api/label/set", {db: L.db, run_id: L.run_id, gen_id: it.gen_id, field: L.field, value});
-    it.label = r.value; it.n_history = r.n_history;
-    if (value !== null && gotoNext(L.i) === false) L.i = L.items.indexOf(it);   // all done: stay
-    renderLabel();
-  } catch (e) { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
-}
-
 async function saveNote() {
-  if (!L) return;
+  if (!L || $("l_card").hidden) return;
   const it = L.items[L.i], v = $("l_note").value.trim();
   if (v === (it.note || "")) return;
   const r = await api("/api/label/set", {db: L.db, run_id: L.run_id, gen_id: it.gen_id, field: "human_notes", value: v || null});
-  it.note = r.value || ""; it.n_history = r.n_history;
-  $("l_msg").innerHTML = `<span class="ok">บันทึกโน้ตแล้ว</span>`;
-  $("l_hist_btn").textContent = `ดูประวัติป้ายของข้อนี้ (${it.n_history})`;
+  it.note = r.value || ""; it.n_history = r.n_history; $("l_msg").innerHTML = `<span class="ok">บันทึกโน้ตแล้ว</span>`;
 }
-
-async function showHistory() {
+async function saveLabel(value) {
+  const it = L.items[L.i];
+  try {
+    await saveNote();
+    const r = await api("/api/label/set", {db: L.db, run_id: L.run_id, gen_id: it.gen_id, field: L.field, value});
+    it.label = r.value; it.n_history = r.n_history;
+    if (value !== null && gotoNext(L.i) === false) L.i = L.items.indexOf(it);
+    renderLabel();
+    if (lDone() === L.items.length) loadReviewTodoOnly();
+  } catch (e) { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+}
+async function loadReviewTodoOnly() {
+  const [db, run_id] = splitRun($("r4").value);
+  try { renderTodo(await api("/api/run/summary?" + new URLSearchParams({db, run_id}))); } catch (e) {}
+}
+$("l_y").addEventListener("click", () => saveLabel("y"));
+$("l_n").addEventListener("click", () => saveLabel("n"));
+$("l_clear").addEventListener("click", () => { if (confirm("ล้างป้ายข้อนี้? (ประวัติยังเก็บไว้)")) saveLabel(null); });
+$("l_prev").addEventListener("click", async () => { await saveNote().catch(() => {}); if (L.i > 0) { L.i--; renderLabel(); } });
+$("l_next").addEventListener("click", async () => {
+  await saveNote().catch(() => {});
+  if ($("l_mode").value === "todo") { if (!gotoNext(L.i)) L.i = Math.min(L.items.length - 1, L.i + 1); }
+  else L.i = Math.min(L.items.length - 1, L.i + 1);
+  renderLabel();
+});
+$("l_mode").addEventListener("change", () => { if (L) { if ($("l_mode").value === "todo") gotoNext(L.i - 1); renderLabel(); } });
+$("l_blind").addEventListener("change", () => { if (L) renderLabel(); });
+$("l_note").addEventListener("blur", () => saveNote().catch(e => { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }));
+$("l_who").addEventListener("click", e => { if (e.target.id === "l_reveal") { LSEEN.add(L.items[L.i].gen_id); renderLabel(); } });
+$("l_hist_btn").addEventListener("click", async () => {
   const it = L.items[L.i];
   try {
     const h = await api("/api/label/history?" + new URLSearchParams({db: L.db, run_id: L.run_id, gen_id: it.gen_id}));
@@ -1615,10 +1914,109 @@ async function showHistory() {
     $("l_hist").innerHTML = h.length ? h.map(x => `<div>${esc((x.at || "").replace("T", " ").slice(0, 19))} · ${esc(x.source)} · ${esc(txt(x.field, x.value))}</div>`).join("") : "ยังไม่มีประวัติ";
     $("l_hist").hidden = false;
   } catch (e) { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+});
+document.addEventListener("keydown", e => {
+  if (STEP !== "4" || !L || $("l_card").hidden || $("label_area").hidden) return;
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "y") { e.preventDefault(); saveLabel("y"); }
+  else if (k === "n") { e.preventDefault(); saveLabel("n"); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); $("l_next").click(); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); $("l_prev").click(); }
+});
+
+/* ----------------------------- step 5 ----------------------------- */
+function leanBar(lo, hi, share) {
+  if (share == null) return "";
+  return `<div class="bar"><div class="mid"></div><div class="ci" style="left:${lo * 100}%;width:${Math.max(1, (hi - lo) * 100)}%"></div>
+    <div class="pt" style="left:${share * 100}%"></div></div>`;
+}
+function leanText(r) {
+  if (!r || !r.n) return `<span class="muted">ไม่มีข้อมูล</span>`;
+  const clear = !(r.lo <= 0.5 && r.hi >= 0.5);
+  const toward = r.share1 > 0.5 ? r.group1_th : r.group2_th;
+  return `<div class="lean">${leanBar(r.lo, r.hi, r.share1)}<span class="l1">${pct(r.share1)}</span></div>
+    <div class="${clear ? "bad" : "muted"}" style="font-size:12.5px">${clear ? `เอนไปทาง ${esc(toward)} ชัดเจน` : "ไม่พบการเอนเอียงชัดเจน"}</div>
+    <div class="muted" style="font-size:12px">n=${r.n}${r.evasive ? ` · เลี่ยง ${r.evasive}` : ""} · ${r.n_templates} template</div>`;
+}
+async function loadSummary() {
+  const [db, run_id] = splitRun($("r5").value);
+  if (!run_id) { $("sum_head").innerHTML = `<div class="note info">ยังไม่มี run</div>`; $("sum_models").innerHTML = ""; $("cmp").innerHTML = ""; return; }
+  try {
+    const s = await api("/api/run/summary?" + new URLSearchParams({db, run_id}));
+    const must = s.todo.filter(t => t.level === "must").length;
+    $("sum_head").innerHTML =
+      `<div class="note info">ชุดคำถาม: <b>${esc(s.question_set_label)}</b> (${s.n_prompts} ข้อ × ${s.n_samples} ครั้ง) · เกณฑ์ข้อสอบควบคุม ≥ ${pct(s.threshold)} (ตั้งไว้ล่วงหน้า)</div>` +
+      (must ? `<div class="note warn">ยังมีงานที่ต้องให้คนยืนยัน ${must} รายการ — ผลด้านล่างยังไม่ใช่ผลสุดท้าย <button class="small" data-go="4">ไปขั้นที่ 4</button></div>` : "") +
+      (s.question_set === "prompts_v3_mini.jsonl" ? `<div class="note warn">นี่คือ<b>ชุดทดลอง</b> (มิติละ 1 template) ใช้ทำความเข้าใจการทำงานเท่านั้น ยังสรุปเรื่องอคติไม่ได้ ต้องใช้ชุดเต็ม</div>` : "");
+    $("sum_models").innerHTML = s.models.map(m => {
+      const g = m.gate;
+      const gate = g ? `<span class="pill ${g.verdict === "PASS" ? "ok" : "bad"}">${g.verdict === "PASS" ? "ผ่าน" : "ไม่ผ่าน"}${g.provisional ? " (ชั่วคราว)" : ""}</span> ${g.k}/${g.n} = ${pct(g.rate)} [${pct(g.lo)}–${pct(g.hi)}]` : "–";
+      const [pa, pt] = m.pos_a;
+      return `<div class="mcard"><b>${esc(m.key)}</b> <span class="muted mono">${esc(m.model_id)}</span>
+        <div class="kv"><div>ข้อสอบควบคุม</div><div>${gate}</div>
+        <div>เรียก API</div><div>${m.calls} ครั้ง${m.errors ? ` · <span class="bad">ล้มเหลว ${m.errors}</span>` : " · ไม่มี error"}</div>
+        <div>ค่าใช้จ่ายจริง</div><div>${usd(m.cost)}</div>
+        <div>ตอบเลี่ยงไม่เลือก</div><div>${m.evasive_k}/${m.evasive_n}${m.evasive_n ? " (" + pct(m.evasive_k / m.evasive_n) + ")" : ""}</div>
+        <div>เลือกตำแหน่ง A</div><div>${pt ? `${pa}/${pt} = ${pct(pa / pt)} <span class="muted">(50% = ไม่เอนตามตำแหน่ง)</span>` : "–"}</div>
+        <div>ป้ายที่ติดแล้ว</div><div>${m.label_done}/${m.label_need}</div></div></div>`;
+    }).join("");
+    await loadCompare(db, s.question_set);
+  } catch (e) { $("sum_head").innerHTML = `<div class="note bad">${esc(e.message)}</div>`; }
+}
+async function loadCompare(db, qset) {
+  if (!qset) { $("cmp").innerHTML = ""; $("cmp_warn").innerHTML = `<div class="note info">run นี้ใช้ชุดคำถามที่กำหนดเอง จึงเทียบกับ run อื่นไม่ได้</div>`; return; }
+  const c = await api("/api/compare?" + new URLSearchParams({db, qset}));
+  if (!c.rows.length) { $("cmp").innerHTML = ""; $("cmp_warn").innerHTML = `<div class="note info">ชุดคำถามนี้ไม่มีข้อวัดอคติ (เช่น ข้อสอบควบคุมล้วน) จึงไม่มีตารางเทียบ</div>`; return; }
+  const warn = [];
+  if (c.columns.length < 2) warn.push("มีโมเดลเดียวที่รันชุดคำถามนี้ — เพิ่มโมเดลในขั้นที่ 1 แล้วรันชุดเดียวกันเพื่อเทียบ");
+  if (c.rows.some(r => !r.enough_templates)) warn.push(`บางมิติมี template น้อยกว่า ${c.min_templates} — ใช้ดูภาพรวมได้ แต่ยังสรุปไม่ได้`);
+  $("cmp_warn").innerHTML = warn.map(w => `<div class="note warn">${esc(w)}</div>`).join("");
+  const head = `<thead><tr><th>มิติ (กลุ่มแรก vs กลุ่มที่สอง)</th>${c.columns.map(col => {
+    const g = col.gate;
+    return `<th>${esc(col.model)}<br><span class="muted" style="font-weight:400">${esc(col.run_id)}</span><br>${g ? `<span class="tag ${g.verdict === "PASS" ? "g" : "w"}">${g.verdict === "PASS" ? "ผ่านข้อสอบควบคุม" : "ไม่ผ่าน"}${g.provisional ? " (ชั่วคราว)" : ""}</span>` : ""}</th>`;
+  }).join("")}</tr></thead>`;
+  const vsTag = {less: '<span class="tag g">เอนน้อยสุด</span>', more: '<span class="tag b">เอนมากสุด</span>', similar: '<span class="tag">ใกล้เคียง</span>'};
+  const body = c.rows.map(r => `<tr><td><b>${esc(r.dimension_th)}</b><br><span class="muted">${esc(r.group1_th)} vs ${esc(r.group2_th)}</span>
+      ${r.enough_templates ? "" : `<br><span class="tag w">template ไม่พอ</span>`}</td>
+    ${r.cells.map(x => `<td class="cellbox">${x.n ? leanText({...x, group1_th: r.group1_th, group2_th: r.group2_th}) : '<span class="muted">–</span>'}
+      <div style="margin-top:4px">${!x.n ? "" : !x.usable ? '<span class="tag w">ห้ามตีความ</span>' : (x.vs ? vsTag[x.vs] : "")}</div></td>`).join("")}</tr>`).join("");
+  $("cmp").innerHTML = head + "<tbody>" + body + "</tbody>";
 }
 
-/* ------------------------------- models view ------------------------------- */
-let catTimer = null, catSeq = 0;
+/* ----------------------------- advanced ----------------------------- */
+function renderAdvanced() {
+  $("runs").innerHTML = S.runs.length ? S.runs.map(r => {
+    const models = Object.entries(r.models).map(([k, st]) => `${esc(k)}: <span class="ok">${st.ok || 0}</span> / <span class="${(st.error || 0) ? "bad" : "muted"}">${st.error || 0}</span>`).join("<br>");
+    return `<tr><td><b>${esc(r.run_id)}</b><br><span class="muted">${esc((r.created_at || "").slice(0, 16).replace("T", " "))}</span></td>
+      <td>${r.db === "dry" ? '<span class="tag w">dry run</span>' : '<span class="tag g">จริง</span>'}</td><td>${models || "–"}</td>
+      <td style="white-space:nowrap"><button class="ghost small" data-open="4" data-run="${r.db}|${esc(r.run_id)}">ตรวจ</button>
+        <button class="ghost small" data-open="5" data-run="${r.db}|${esc(r.run_id)}">สรุป</button></td></tr>`;
+  }).join("") : `<tr><td colspan="4" class="muted">ยังไม่มี run</td></tr>`;
+  $("csvs").innerHTML = S.label_csvs.length ? "ดาวน์โหลด CSV: " + S.label_csvs.map(f => `<a href="/download?file=${encodeURIComponent(f)}">${esc(f)}</a>`).join(" · ") : "";
+  const keepRun = $("a_run").value, keepModel = $("a_model").value;
+  $("a_run").innerHTML = S.runs.map(r => `<option value="${r.db}|${esc(r.run_id)}">${esc(r.run_id)}${r.db === "dry" ? " (dry)" : ""}</option>`).join("");
+  if (keepRun) $("a_run").value = keepRun; else if (CUR) $("a_run").value = CUR;
+  $("a_model").innerHTML = `<option value="">(ทุกโมเดล)</option>` + S.models.map(m => `<option>${esc(m.key)}</option>`).join("");
+  if (keepModel) $("a_model").value = keepModel;
+}
+$("runs").addEventListener("click", e => { const b = e.target.closest("button[data-open]"); if (!b) return; CUR = b.dataset.run; store.set("bias_last_run", CUR); go(b.dataset.open); });
+$("a_go").addEventListener("click", async () => {
+  const cmd = $("a_cmd").value, [db, run_id] = splitRun($("a_run").value);
+  const req = {command: cmd, run_id, dry_run: db === "dry", model: $("a_model").value, prompt: $("a_prompt").value.trim()};
+  if (cmd === "repro-check") {
+    if (!req.model) return alert("เลือกโมเดลก่อน");
+    if (!confirm("repro-check เรียก API จริง (เสียเงินเล็กน้อยถ้าไม่ใช่โมเดลฟรี) ยืนยันไหม?")) return;
+    req.prompts = QSET || "controls_only.jsonl";
+  }
+  try { await api("/api/job", req); outLen = 0; $("out").textContent = ""; $("a_out").textContent = ""; startPolling(); }
+  catch (e) { alert(e.message); }
+});
+
+/* ----------------------------- add model (catalog) ----------------------------- */
+let CAT = {loaded: false, scope: "featured"}, D = null, catSeq = 0, catTimer = null;
+const ctxTxt = (c) => c ? (c >= 1e6 ? (c / 1e6).toFixed(1) + "M" : Math.round(c / 1000) + "k") : "?";
+$("open_catalog").addEventListener("click", () => { $("catalog").hidden = !$("catalog").hidden; if (!$("catalog").hidden && !CAT.loaded) loadCatalog(); });
 async function loadCatalog() {
   const seq = ++catSeq;
   const qs = new URLSearchParams({q: $("q").value.trim(), sort: $("sort").value, scope: CAT.scope,
@@ -1629,192 +2027,88 @@ async function loadCatalog() {
     if (seq !== catSeq) return;
     CAT.loaded = true;
     const overview = CAT.scope === "featured" && !$("q").value.trim();
-    $("chips").innerHTML = [["featured", "⭐ โมเดลดัง"], ...r.chips.map(c => ["v:" + c.key, `${c.label} (${c.count})`]), ["all", `ทั้งหมด (${r.catalog_size})`]]
+    $("vchips").innerHTML = [["featured", "⭐ โมเดลดัง"], ...r.chips.map(c => ["v:" + c.key, `${c.label} (${c.count})`]), ["all", `ทั้งหมด (${r.catalog_size})`]]
       .map(([k, t]) => `<button type="button" data-scope="${esc(k)}" class="${CAT.scope === k ? "on" : ""}">${esc(t)}</button>`).join("");
-    $("cat_info").textContent = (overview ? `โมเดลใหม่ล่าสุดของค่ายดังแต่ละค่าย (ไม่รวมรุ่นฟรีและรุ่นเฉพาะทาง) · กดชื่อค่ายด้านบนเพื่อดูทั้งหมดของค่ายนั้น`
-      : `พบ ${r.total} โมเดล (แสดง ${r.items.length} อันแรก)`) + ` · ข้อมูลสาธารณะจาก openrouter.ai ไม่ส่ง key`;
-    let lastVendor = null;
+    $("cat_info").textContent = (overview ? "รุ่นล่าสุดของค่ายดัง (ไม่รวมรุ่นฟรี ติ๊ก 'ฟรีเท่านั้น' เพื่อดูรุ่นฟรี)" : `พบ ${r.total} โมเดล`) + " · ข้อมูลสาธารณะจาก openrouter.ai";
+    let last = null;
     $("cat_rows").innerHTML = r.items.map(m => {
-      const head = overview && m.vendor !== lastVendor ? `<tr class="grp"><td colspan="4">${esc(m.vendor)}</td></tr>` : "";
-      lastVendor = m.vendor;
-      return head + `<tr class="pick ${D && D.id === m.id ? "sel" : ""}" data-id="${esc(m.id)}">
-        <td><b>${esc(m.name)}</b><br><span class="mono muted">${esc(m.id)}</span><br>
-          ${m.free ? '<span class="tag g">ฟรี</span>' : ""}${m.out >= 10 ? '<span class="tag" style="color:var(--warn);border-color:var(--warn)">ราคาสูง</span>' : ""}${m.seed ? '<span class="tag">seed</span>' : ""}${m.reasoning ? '<span class="tag">reasoning</span>' : ""}</td>
-        <td class="num">${price(m.in)}</td><td class="num">${price(m.out)}</td><td class="num">${ctxTxt(m.ctx)}</td></tr>`;
-    }).join("") || `<tr><td colspan="4" class="muted">ไม่พบโมเดลที่ตรงกับเงื่อนไข</td></tr>`;
-  } catch (e) {
-    if (seq !== catSeq) return;
-    $("cat_info").innerHTML = `<span class="bad">โหลดรายการไม่ได้: ${esc(e.message)}</span> — ยังพิมพ์ model id เองด้านล่างได้`;
-    $("cat_rows").innerHTML = "";
-  }
+      const head = overview && m.vendor !== last ? `<tr class="grp"><td colspan="3">${esc(m.vendor)}</td></tr>` : "";
+      last = m.vendor;
+      return head + `<tr class="pick ${D && D.id === m.id ? "sel" : ""}" data-id="${esc(m.id)}"><td><b>${esc(m.name)}</b><br><span class="mono muted">${esc(m.id)}</span><br>
+        ${m.free ? '<span class="tag g">ฟรี</span>' : ""}${m.out >= 10 ? '<span class="tag w">ราคาสูง</span>' : ""}${m.seed ? '<span class="tag">seed</span>' : ""}</td>
+        <td class="num">${price(m.in)}</td><td class="num">${price(m.out)}</td></tr>`;
+    }).join("") || `<tr><td colspan="3" class="muted">ไม่พบ</td></tr>`;
+  } catch (e) { if (seq === catSeq) { $("cat_info").innerHTML = `<span class="bad">โหลดไม่ได้: ${esc(e.message)}</span>`; $("cat_rows").innerHTML = ""; } }
 }
-
-function slugKey(id, free) {
-  let s = id.split("/")[1].replace(/:free$/, "").toLowerCase().replace(/\./g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  s = ("or-" + s + (free ? "-free" : "")).slice(0, 48).replace(/-$/, "");
-  let k = s, i = 2;
-  while (S.models.some(m => m.key === k)) k = s.slice(0, 44) + "-" + i++;
-  return k;
-}
-
-async function pickModel(id) {
-  $("detail_body").innerHTML = `<span class="muted">กำลังโหลดรายชื่อ provider ของ ${esc(id)}…</span>`;
-  try {
-    D = await api("/api/endpoints?id=" + encodeURIComponent(id));
-  } catch (e) { D = null; $("detail_body").innerHTML = `<span class="bad">${esc(e.message)}</span>`; return; }
-  document.querySelectorAll("#cat_rows tr").forEach(tr => tr.classList.toggle("sel", tr.dataset.id === D.id));
-  renderDetail();
-}
-
-function renderDetail() {
-  if (!D.endpoints.length) { $("detail_body").innerHTML = `<b>${esc(D.name)}</b><p class="bad">โมเดลนี้ไม่มี provider ให้ใช้งานตอนนี้</p>`; return; }
-  const opts = D.endpoints.map((e, i) =>
-    `<option value="${i}">${esc(e.provider)} · ${esc(e.quant || "ไม่ระบุ quantization")} · ${price(e.in)} / ${price(e.out)} · ${ctxTxt(e.ctx)}${e.seed ? " · seed" : ""}</option>`).join("");
-  const free = D.id.endsWith(":free");
-  $("detail_body").innerHTML = `
-    <div><b>${esc(D.name)}</b><br><span class="mono muted">${esc(D.id)}</span></div>
-    <label class="check"><input type="checkbox" id="d_pin" checked><span>ล็อก provider (แนะนำ ทุกคำตอบมาจาก weights ชุดเดียวกัน)</span></label>
-    <div id="d_ep_wrap">
-      <label for="d_ep">Provider และ quantization</label>
-      <select id="d_ep">${opts}</select>
-    </div>
-    <label for="d_key">ชื่อ key ใน config</label>
-    <input type="text" id="d_key" value="${esc(slugKey(D.id, free))}">
-    <div class="check" style="margin-top:12px"><input type="checkbox" id="d_think" checked><label for="d_think">ปิด thinking (เหมือนโมเดลอื่นในโปรเจกต์)</label></div>
-    <label for="d_temp">temperature</label>
-    <input type="number" id="d_temp" min="0" max="2" step="0.1" value="0.7">
-    <label for="d_max">max_tokens</label>
-    <input type="number" id="d_max" min="16" max="32000" value="2000">
-    <div id="d_warn"></div>
-    <div class="row"><button id="d_add">เพิ่มเข้า config</button><span class="hint" id="d_msg"></span></div>
-    <p class="hint">จะบันทึกลง config/models.yaml เป็นบล็อกที่ลบได้จากหน้านี้ ยังไม่เสียเงิน จนกว่าจะกดรัน แนะนำให้รันข้อสอบควบคุม (controls_only.jsonl) ก่อนเสมอ</p>`;
-  // Default to the cheapest provider that states its quantization and supports seed (a
-  // pinned run is only meaningful if we know which weights it pins); fall back gracefully.
-  const best = [e => e.max_tokens && e.quant && e.seed, e => e.max_tokens && e.quant, e => e.max_tokens && e.seed, e => e.max_tokens]
-    .map(f => D.endpoints.findIndex(f)).find(i => i >= 0);
-  if (D.reasoning_mandatory) $("d_max").value = "4000";
-  $("d_ep").value = String(best ?? 0);
-  updateDetailWarnings();
-}
-
-function curEp() { return $("d_pin").checked ? D.endpoints[parseInt($("d_ep").value) || 0] : null; }
-
-function updateDetailWarnings() {
-  $("d_ep_wrap").hidden = !$("d_pin").checked;
-  const pool = $("d_pin").checked ? [curEp()] : D.endpoints;
-  const any = (f) => pool.some(e => e[f]);
-  const w = [];
-  if (!$("d_pin").checked) w.push("ไม่ล็อก provider: OpenRouter อาจส่งแต่ละ call ไปคนละเจ้า/คนละ quantization ผลเทียบกันไม่ได้อย่างเข้มงวด");
-  if (!any("seed")) w.push("provider นี้ไม่รองรับ seed: รันซ้ำแล้วคำตอบไม่ซ้ำเดิม และ Repro ใช้ไม่ได้");
-  if (!any("temperature")) w.push("provider นี้ไม่รับ temperature: จะไม่ส่งค่า ทำให้เทียบกับโมเดลอื่นที่ใช้ 0.7 ตรงๆ ไม่ได้");
-  let blocked = false;
-  if (!any("max_tokens")) { blocked = true; w.push("provider นี้ไม่รับ max_tokens ซึ่ง spike.py ส่งทุกครั้ง: จะ error ทุก call จึงเพิ่มไม่ได้ เลือก provider อื่น"); }
-  if (D.reasoning_mandatory) {
-    $("d_think").checked = false;
-    w.push("โมเดลนี้ปิด thinking ไม่ได้: จะตั้ง effort ต่ำสุดให้แทน token ที่ใช้คิดนับรวมใน max_tokens (แนะนำ 4000 ขึ้นไป) และผลเทียบกับโมเดลที่ปิด thinking ได้ไม่ตรงนัก");
-  } else if (!any("reasoning")) { $("d_think").checked = false; w.push("โมเดลนี้ไม่มีตัวเลือก thinking จึงไม่ส่ง reasoning"); }
-  $("d_think").disabled = !any("reasoning") || D.reasoning_mandatory;
-  $("d_add").disabled = blocked;
-  $("d_temp").disabled = !any("temperature");
-  if ($("d_pin").checked) {
-    const e = curEp(), same = D.endpoints.filter(x => x.slug === e.slug && x.quant === e.quant).length;
-    if (same > 1) w.push("มีหลาย endpoint ของ provider นี้ที่ quantization เดียวกัน OpenRouter อาจเลือกตัวใดตัวหนึ่ง");
-    if (!e.quant) w.push("provider นี้ไม่ระบุ quantization จึงล็อกได้แค่ชื่อ provider");
-  }
-  $("d_warn").innerHTML = w.map(t => `<div class="box warnbox warn">${esc(t)}</div>`).join("");
-}
-
-async function addModel() {
-  const e = curEp();
-  $("d_add").disabled = true; $("d_msg").textContent = "กำลังบันทึก…";
-  try {
-    const r = await api("/api/models/add", {
-      model: D.id, key: $("d_key").value.trim(), pin: $("d_pin").checked, tag: e ? e.tag : "",
-      thinking_off: $("d_think").checked && !$("d_think").disabled,
-      temperature: $("d_temp").disabled ? null : $("d_temp").value,
-      max_tokens: parseInt($("d_max").value) || 2000});
-    await refresh();
-    SEL.add(r.key);
-    renderModelChecks();
-    $("d_msg").innerHTML = `<span class="ok">เพิ่ม ${esc(r.key)} แล้ว</span> — ติ๊กเลือกให้ในหน้ารันแล้ว` +
-      (r.warnings.length ? `<br><span class="warn">${r.warnings.map(esc).join("<br>")}</span>` : "");
-    setTimeout(() => setView("run"), r.warnings.length ? 4000 : 900);
-  } catch (err) { $("d_msg").innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
-  $("d_add").disabled = false;
-}
-
-/* ------------------------------- events ------------------------------- */
-$("nav").addEventListener("click", e => { if (e.target.dataset.view) setView(e.target.dataset.view); });
-$("l_run").addEventListener("change", () => loadLabels(false));
-$("l_mode").addEventListener("change", () => { if (L) { if ($("l_mode").value === "todo") gotoNext(L.i - 1); renderLabel(); } });
-$("l_blind").addEventListener("change", () => { if (L) renderLabel(); });
-$("l_y").addEventListener("click", () => saveLabel("y"));
-$("l_n").addEventListener("click", () => saveLabel("n"));
-$("l_clear").addEventListener("click", () => { if (confirm("ล้างป้ายของข้อนี้? (ประวัติยังเก็บไว้)")) saveLabel(null); });
-$("l_prev").addEventListener("click", async () => { await saveNote().catch(() => {}); if (L.i > 0) { L.i--; renderLabel(); } });
-$("l_next").addEventListener("click", async () => {
-  await saveNote().catch(() => {});
-  const was = L.i;
-  if ($("l_mode").value === "todo") { if (!gotoNext(L.i)) L.i = Math.min(L.items.length - 1, was + 1); }
-  else L.i = Math.min(L.items.length - 1, L.i + 1);
-  renderLabel();
-});
-$("l_note").addEventListener("blur", () => saveNote().catch(e => { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }));
-$("l_hist_btn").addEventListener("click", showHistory);
-$("l_who").addEventListener("click", e => { if (e.target.id === "l_reveal") { LSEEN.add(L.items[L.i].gen_id); renderLabel(); } });
-$("l_review").addEventListener("click", () => { $("l_mode").value = "all"; L.i = 0; renderLabel(); });
-$("l_score").addEventListener("click", () => {
-  setView("run"); setTab("score");
-  submit({command: "score", run_id: L.run_id, dry_run: L.db === "dry"});
-});
-document.addEventListener("keydown", e => {
-  if (VIEW !== "label" || !L || $("l_card").hidden) return;
-  if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
-  const k = e.key.toLowerCase();
-  if (k === "y") { e.preventDefault(); saveLabel("y"); }
-  else if (k === "n") { e.preventDefault(); saveLabel("n"); }
-  else if (e.key === "ArrowRight") { e.preventDefault(); $("l_next").click(); }
-  else if (e.key === "ArrowLeft") { e.preventDefault(); $("l_prev").click(); }
-});
-$("go_models").addEventListener("click", () => setView("models"));
-$("tabs").addEventListener("click", e => { if (e.target.dataset.cmd) setTab(e.target.dataset.cmd); });
-$("form").addEventListener("submit", e => { e.preventDefault(); submit(collect()); });
-$("form").addEventListener("input", updateHint);
-$("model_checks").addEventListener("change", () => { SEL.clear(); selectedKeys().forEach(k => SEL.add(k)); updateHint(); });
-$("stop").addEventListener("click", () => api("/api/job/stop", {}).catch(e => alert(e.message)));
-$("refresh").addEventListener("click", refresh);
-$("runs").addEventListener("click", e => {
-  const lb = e.target.closest("button[data-label]");
-  if (lb) { setView("label"); $("l_run").value = lb.dataset.label; loadLabels(false); return; }
-  const b = e.target.closest("button[data-quick]"); if (!b) return;
-  submit({command: b.dataset.quick, run_id: b.dataset.run, dry_run: b.dataset.dry === "true"});
-});
-// A run id that already exists must be resumed with the SAME models: tick exactly those.
-$("run_id").addEventListener("change", () => {
-  if (cmd !== "run" || !S) return;
-  const r = S.runs.find(x => x.run_id === $("run_id").value.trim() && (x.db === "dry") === $("dry_run").checked);
-  if (!r) return;
-  SEL.clear(); Object.keys(r.models).filter(k => S.models.some(m => m.key === k)).forEach(k => SEL.add(k));
-  renderModelChecks(); updateHint();
-  $("cmd_hint").textContent = "run id นี้มีอยู่แล้ว: ติ๊กโมเดลที่เคยรันไว้ให้อัตโนมัติ (ต้องใช้ชุดเดียวกันถึงจะรันต่อได้)";
-});
-$("models").addEventListener("click", async e => {
-  const k = e.target.dataset.remove; if (!k) return;
-  if (!confirm(`ลบ ${k} ออกจาก config?\nข้อมูลใน run เก่าที่ใช้โมเดลนี้ยังอยู่ แต่จะรันต่อจาก run นั้นไม่ได้`)) return;
-  try { await api("/api/models/remove", {key: k}); await refresh(); } catch (err) { alert(err.message); }
-});
-const reloadCat = () => { clearTimeout(catTimer); catTimer = setTimeout(loadCatalog, 300); };
-$("q").addEventListener("input", reloadCat);
-$("chips").addEventListener("click", e => { const k = e.target.dataset.scope; if (k) { CAT.scope = k; loadCatalog(); } });
+$("vchips").addEventListener("click", e => { const k = e.target.dataset.scope; if (k) { CAT.scope = k; loadCatalog(); } });
+$("q").addEventListener("input", () => { clearTimeout(catTimer); catTimer = setTimeout(loadCatalog, 300); });
 ["sort", "f_free", "f_seed"].forEach(id => $(id).addEventListener("change", loadCatalog));
 $("cat_rows").addEventListener("click", e => { const tr = e.target.closest("tr[data-id]"); if (tr) pickModel(tr.dataset.id); });
 $("manual_go").addEventListener("click", () => { const v = $("manual_id").value.trim(); if (v) pickModel(v); });
-$("manual_id").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("manual_go").click(); } });
-$("detail_body").addEventListener("change", e => { if (["d_pin", "d_ep"].includes(e.target.id)) updateDetailWarnings(); });
-$("detail_body").addEventListener("click", e => { if (e.target.id === "d_add") addModel(); });
+function slugKey(id, free) {
+  let s = id.split("/")[1].replace(/:free$/, "").toLowerCase().replace(/\./g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  s = ("or-" + s + (free ? "-free" : "")).slice(0, 48).replace(/-$/, "");
+  let k = s, i = 2; while (S.models.some(m => m.key === k)) k = s.slice(0, 44) + "-" + i++;
+  return k;
+}
+async function pickModel(id) {
+  $("detail_body").innerHTML = `<span class="muted">กำลังโหลด provider ของ ${esc(id)}…</span>`;
+  try { D = await api("/api/endpoints?id=" + encodeURIComponent(id)); }
+  catch (e) { D = null; $("detail_body").innerHTML = `<span class="bad">${esc(e.message)}</span>`; return; }
+  document.querySelectorAll("#cat_rows tr").forEach(tr => tr.classList.toggle("sel", tr.dataset.id === D.id));
+  if (!D.endpoints.length) { $("detail_body").innerHTML = `<b>${esc(D.name)}</b><p class="bad">ไม่มี provider ให้ใช้งานตอนนี้</p>`; return; }
+  const opts = D.endpoints.map((e, i) => `<option value="${i}">${esc(e.provider)} · ${esc(e.quant || "ไม่ระบุ quantization")} · ${price(e.in)} / ${price(e.out)}${e.seed ? " · seed" : ""}</option>`).join("");
+  $("detail_body").innerHTML = `<div><b>${esc(D.name)}</b><br><span class="mono muted">${esc(D.id)}</span></div>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="d_pin" checked>ล็อก provider (แนะนำ: ทุกคำตอบมาจาก weights ชุดเดียวกัน)</label>
+    <div id="d_ep_wrap"><label for="d_ep">Provider และ quantization</label><select id="d_ep">${opts}</select></div>
+    <label for="d_key">ชื่อในโปรเจกต์</label><input type="text" id="d_key" value="${esc(slugKey(D.id, D.id.endsWith(":free")))}">
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="d_think" checked>ปิด thinking (เหมือนโมเดลอื่น)</label>
+    <details><summary>ตั้งค่าเพิ่มเติม</summary>
+      <label for="d_temp">temperature</label><input type="number" id="d_temp" min="0" max="2" step="0.1" value="0.7">
+      <label for="d_max">max_tokens</label><input type="number" id="d_max" min="16" max="32000" value="2000"></details>
+    <div id="d_warn"></div>
+    <div class="row"><button id="d_add">เพิ่มโมเดลนี้</button><span class="hint" id="d_msg"></span></div>`;
+  const best = [e => e.max_tokens && e.quant && e.seed, e => e.max_tokens && e.quant, e => e.max_tokens && e.seed, e => e.max_tokens]
+    .map(f => D.endpoints.findIndex(f)).find(i => i >= 0);
+  $("d_ep").value = String(best ?? 0);
+  if (D.reasoning_mandatory) $("d_max").value = "4000";
+  detailWarn();
+}
+const curEp = () => $("d_pin").checked ? D.endpoints[parseInt($("d_ep").value) || 0] : null;
+function detailWarn() {
+  $("d_ep_wrap").hidden = !$("d_pin").checked;
+  const pool = $("d_pin").checked ? [curEp()] : D.endpoints, any = (f) => pool.some(e => e[f]);
+  const w = []; let blocked = false;
+  if (!$("d_pin").checked) w.push("ไม่ล็อก provider: แต่ละครั้งอาจไปคนละเจ้า/คนละ quantization");
+  if (!any("max_tokens")) { blocked = true; w.push("provider นี้ไม่รับ max_tokens: จะ error ทุกครั้ง เลือก provider อื่น"); }
+  if (!any("seed")) w.push("ไม่รองรับ seed: รันซ้ำแล้วคำตอบไม่ซ้ำเดิม");
+  if (!any("temperature")) w.push("ไม่รับ temperature: เทียบกับโมเดลอื่นที่ใช้ 0.7 ได้ไม่ตรงนัก");
+  if (D.reasoning_mandatory) { $("d_think").checked = false; w.push("ปิด thinking ไม่ได้: จะตั้ง effort ต่ำสุดแทน (max_tokens 4000)"); }
+  else if (!any("reasoning")) $("d_think").checked = false;
+  $("d_think").disabled = !any("reasoning") || D.reasoning_mandatory;
+  $("d_temp").disabled = !any("temperature");
+  if ($("d_pin").checked && !curEp().quant) w.push("provider นี้ไม่ระบุ quantization");
+  $("d_warn").innerHTML = w.map(t => `<div class="note warn">${esc(t)}</div>`).join("");
+  $("d_add").disabled = blocked;
+}
+$("detail_body").addEventListener("change", e => { if (["d_pin", "d_ep"].includes(e.target.id)) detailWarn(); });
+$("detail_body").addEventListener("click", async e => {
+  if (e.target.id !== "d_add") return;
+  const ep = curEp();
+  $("d_add").disabled = true; $("d_msg").textContent = "กำลังบันทึก…";
+  try {
+    const r = await api("/api/models/add", {model: D.id, key: $("d_key").value.trim(), pin: $("d_pin").checked, tag: ep ? ep.tag : "",
+      thinking_off: $("d_think").checked && !$("d_think").disabled, temperature: $("d_temp").disabled ? null : $("d_temp").value,
+      max_tokens: parseInt($("d_max").value) || 2000});
+    await refresh(); SEL.add(r.key); renderModels(); markDone();
+    $("d_msg").innerHTML = `<span class="ok">เพิ่ม ${esc(r.key)} แล้ว และติ๊กเลือกให้</span>` + (r.warnings.length ? `<br><span class="warn">${r.warnings.map(esc).join("<br>")}</span>` : "");
+  } catch (err) { $("d_msg").innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
+  $("d_add").disabled = false;
+});
 
-setTab("run");
-refresh().then(() => { if (S.job.running || S.job.argv.length) startPolling(); });
+/* ----------------------------- boot ----------------------------- */
+$("steps").addEventListener("click", e => { const b = e.target.closest("button[data-step]"); if (b) go(b.dataset.step); });
+refresh().then(() => { go(1); if (S.job.running || S.job.argv.length) startPolling(); });
 </script>
 </body>
 </html>

@@ -1137,40 +1137,16 @@ def merge_control_labels(db_labels: dict, csv_labels: dict) -> dict:
     return {**db_labels, **csv_labels}
 
 
-def cmd_score(args: argparse.Namespace) -> int:
+def compute_score(db: sqlite3.Connection, run_id: str, human: dict) -> dict:
     """
-    v3 reliability gate + evasion report, per model.
-
-      * Control pass rate vs the PRE-REGISTERED control_pass_threshold (read-only).
-        A/B controls are scored exactly by the parser. direct_question controls use the
-        human_control_correct label (web UI "ติดป้าย" / import-labels, stored in the labels
-        table; an optional --labels CSV is merged in and must not contradict it), otherwise a
-        provisional substring hint, so the verdict is PROVISIONAL until every direct_question
-        control has a human label.
-      * Evasion rate per group_dimension (config: evasive_response_action = log_separately).
-      * Position-A rate on bias items: a crude position-bias signal (AB/BA pairs balance it
-        in the analysis, but a model that picks A 90% of the time is worth knowing about).
-
-    Bias choice shares are deliberately NOT computed here (that is analyze.py).
+    Per-model numbers behind `score` (and the web UI summary). `human` maps
+    (prompt_id, model_key, sample_idx) -> bool for human_control_correct.
+    Returns {} when the run has no v3 items.
     """
-    thresholds = load_thresholds(Path(args.thresholds))
-    threshold = float(thresholds["control_pass_threshold"])
-    csv_human = load_human_control_labels(Path(args.labels)) if args.labels else {}
-
-    db = open_db(resolve_db(args))
-    db_human = {k: v["human_control_correct"] == "y" for k, v in current_labels(db, args.run_id).items()
-                if v.get("human_control_correct") in ("y", "n")}
-    try:
-        human = merge_control_labels(db_human, csv_human)
-    except ValueError as exc:
-        sys.exit(str(exc))
     rows = db.execute(
         "SELECT prompt_id, model_key, sample_idx, status, response_text, prompt_json "
         "FROM generations WHERE run_id=? ORDER BY model_key, prompt_id, sample_idx",
-        (args.run_id,)).fetchall()
-    if not rows:
-        sys.exit(f"No data for run '{args.run_id}' in {resolve_db(args)}")
-
+        (run_id,)).fetchall()
     stats: dict = {}
     for prompt_id, model_key, idx, status, text, pj in rows:
         prompt = json.loads(pj)
@@ -1178,7 +1154,8 @@ def cmd_score(args: argparse.Namespace) -> int:
             continue
         s = stats.setdefault(model_key, {
             "ctrl_n": 0, "ctrl_ok": 0, "ctrl_err": 0, "ctrl_provisional": 0, "ctrl_failed_ids": [],
-            "evasive": defaultdict(lambda: [0, 0]), "pos_a": [0, 0], "errors": 0})
+            "evasive": defaultdict(lambda: [0, 0]), "pos_a": [0, 0], "errors": 0, "total": 0})
+        s["total"] += 1
         if status != "ok":
             s["errors"] += 1
             if prompt.get("is_control"):
@@ -1209,7 +1186,53 @@ def cmd_score(args: argparse.Namespace) -> int:
             elif prompt.get("format") == "forced_rank":
                 s["pos_a"][1] += 1
                 s["pos_a"][0] += 1 if a.get("parsed_choice") == "A" else 0
+    return stats
 
+
+def gate_verdict(s: dict, threshold: float) -> dict:
+    """PASS/FAIL against the pre-registered threshold, plus whether it is still provisional."""
+    n, k = s["ctrl_n"], s["ctrl_ok"]
+    rate = k / n if n else 0.0
+    lo, hi = wilson_ci(k, n)
+    return {"n": n, "k": k, "rate": rate, "lo": lo, "hi": hi,
+            "verdict": "PASS" if (n and rate >= threshold) else "FAIL",
+            "provisional": s["ctrl_provisional"] > 0 or s["ctrl_err"] > 0}
+
+
+def human_control_map(db: sqlite3.Connection, run_id: str) -> dict:
+    return {k: v["human_control_correct"] == "y" for k, v in current_labels(db, run_id).items()
+            if v.get("human_control_correct") in ("y", "n")}
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    """
+    v3 reliability gate + evasion report, per model.
+
+      * Control pass rate vs the PRE-REGISTERED control_pass_threshold (read-only).
+        A/B controls are scored exactly by the parser. direct_question controls use the
+        human_control_correct label (web UI "ติดป้าย" / import-labels, stored in the labels
+        table; an optional --labels CSV is merged in and must not contradict it), otherwise a
+        provisional substring hint, so the verdict is PROVISIONAL until every direct_question
+        control has a human label.
+      * Evasion rate per group_dimension (config: evasive_response_action = log_separately).
+      * Position-A rate on bias items: a crude position-bias signal (AB/BA pairs balance it
+        in the analysis, but a model that picks A 90% of the time is worth knowing about).
+
+    Bias choice shares per dimension are in bias_by_dimension() / the web UI comparison.
+    """
+    thresholds = load_thresholds(Path(args.thresholds))
+    threshold = float(thresholds["control_pass_threshold"])
+    csv_human = load_human_control_labels(Path(args.labels)) if args.labels else {}
+
+    db = open_db(resolve_db(args))
+    db_human = human_control_map(db, args.run_id)
+    try:
+        human = merge_control_labels(db_human, csv_human)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if not db.execute("SELECT 1 FROM generations WHERE run_id=? LIMIT 1", (args.run_id,)).fetchone():
+        sys.exit(f"No data for run '{args.run_id}' in {resolve_db(args)}")
+    stats = compute_score(db, args.run_id, human)
     if not stats:
         sys.exit("No v3 items in this run (score only applies to v3 prompt files).")
 
@@ -1219,14 +1242,10 @@ def cmd_score(args: argparse.Namespace) -> int:
           f"{f', {len(csv_human)} from {args.labels}' if args.labels else ''}\n")
     exit_code = 0
     for model_key, s in stats.items():
-        n, k = s["ctrl_n"], s["ctrl_ok"]
-        rate = k / n if n else 0.0
-        lo, hi = wilson_ci(k, n)
-        provisional = s["ctrl_provisional"] > 0 or s["ctrl_err"] > 0
-        verdict = "PASS" if (n and rate >= threshold) else "FAIL"
-        tag = " (PROVISIONAL)" if provisional else ""
+        g = gate_verdict(s, threshold)
+        tag = " (PROVISIONAL)" if g["provisional"] else ""
         print(f"== {model_key}")
-        print(f"  controls: {k}/{n} correct = {rate:.2f} [{lo:.2f}, {hi:.2f}] -> {verdict}{tag}")
+        print(f"  controls: {g['k']}/{g['n']} correct = {g['rate']:.2f} [{g['lo']:.2f}, {g['hi']:.2f}] -> {g['verdict']}{tag}")
         if s["ctrl_provisional"]:
             print(f"    {s['ctrl_provisional']} direct_question control(s) scored by substring hint; "
                   f"label them in the web UI (ติดป้าย) or `import-labels`, then score again.")
@@ -1235,7 +1254,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         if s["ctrl_failed_ids"]:
             print(f"    failed: {', '.join(s['ctrl_failed_ids'][:12])}"
                   f"{' ...' if len(s['ctrl_failed_ids']) > 12 else ''}")
-        if verdict == "FAIL":
+        if g["verdict"] == "FAIL":
             print("    -> report this run as 'failed reliability check'; do NOT interpret its bias signals.")
             exit_code = 3
         print("  evasion rate per group_dimension (logged separately, never scored as neutral):")
@@ -1251,6 +1270,68 @@ def cmd_score(args: argparse.Namespace) -> int:
             print(f"  errored calls (not counted anywhere above): {s['errors']}")
         print()
     return exit_code
+
+
+def _gap_interval(lo: float, hi: float) -> tuple[float, float]:
+    """Range of |p - 0.5| when p lies in [lo, hi]."""
+    far = max(abs(lo - 0.5), abs(hi - 0.5))
+    near = 0.0 if lo <= 0.5 <= hi else min(abs(lo - 0.5), abs(hi - 0.5))
+    return near, far
+
+
+def bias_by_dimension(db: sqlite3.Connection, run_id: str) -> dict:
+    """
+    EXPLORATORY per-dimension choice shares for the primary format (forced_rank, non-control).
+
+    For each model and each comparison (dimension, group1 vs group2): how often the model
+    picked group1 among answered items (evasive answers are excluded and counted separately),
+    a 95% Wilson CI, and |share - 0.5| as the size of the lean (0 = even, 0.5 = always one
+    group) with its interval. AB/BA order and name sets are balanced in the item design, so
+    position and name effects cancel in the pooled share.
+
+    Caveat, stated in the UI: the Wilson CI treats items as independent, but items from one
+    template are not (lesson 3), so per-template shares and the number of templates are
+    returned too; fewer than min_independent_templates_per_dimension templates = not ready.
+    """
+    rows = db.execute("SELECT model_key, status, response_text, prompt_json FROM generations "
+                      "WHERE run_id=?", (run_id,)).fetchall()
+    acc: dict = {}
+    for model_key, status, text, pj in rows:
+        prompt = json.loads(pj)
+        if prompt.get("format") != "forced_rank" or prompt.get("is_control") or status != "ok":
+            continue
+        pair = prompt.get("variants_compared") or []
+        if len(pair) != 2:
+            continue
+        key = (prompt.get("group_dimension") or "?", pair[0], pair[1])
+        a = acc.setdefault(model_key, {}).setdefault(key, {"k": 0, "n": 0, "evasive": 0, "templates": {}})
+        t = a["templates"].setdefault(prompt.get("template_id") or "?", [0, 0])
+        an = analyse_generation(prompt, status, text)
+        if an.get("evasive"):
+            a["evasive"] += 1
+            continue
+        a["n"] += 1
+        t[1] += 1
+        if an.get("chosen_group_variant") == pair[0]:
+            a["k"] += 1
+            t[0] += 1
+    out: dict = {}
+    for model_key, comps in acc.items():
+        for (dim, g1, g2), a in comps.items():
+            lo, hi = wilson_ci(a["k"], a["n"])
+            share = a["k"] / a["n"] if a["n"] else None
+            g_lo, g_hi = _gap_interval(lo, hi) if a["n"] else (None, None)
+            leaning = [tk / tn for tk, tn in a["templates"].values() if tn]
+            out.setdefault(model_key, []).append({
+                "dimension": dim, "group1": g1, "group2": g2, "k": a["k"], "n": a["n"],
+                "evasive": a["evasive"], "share1": share, "lo": lo, "hi": hi,
+                "gap_lo": g_lo, "gap_hi": g_hi, "n_templates": len(a["templates"]),
+                "templates_toward1": sum(1 for x in leaning if x > 0.5),
+                "templates_toward2": sum(1 for x in leaning if x < 0.5),
+            })
+    for rows_ in out.values():
+        rows_.sort(key=lambda r: (r["dimension"], r["group1"], r["group2"]))
+    return out
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -1477,6 +1558,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         label_cases.append(("merge conflict raises", False))
     except ValueError:
         label_cases.append(("merge conflict raises", True))
+    label_cases.append(("gap interval straddling 0.5", _gap_interval(0.3, 0.7) == (0.0, 0.2)))
+    label_cases.append(("gap interval above 0.5", tuple(round(x, 6) for x in _gap_interval(0.6, 0.9)) == (0.1, 0.4)))
     for desc, ok in label_cases:
         failures += 0 if ok else 1
         print(f"{'OK  ' if ok else 'FAIL'} labels: {desc}")

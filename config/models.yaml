@@ -20,7 +20,34 @@
 #   * Keep `note` in sync with https://openrouter.ai/api/v1/models/<id>/endpoints
 #     (provider list, quantization, price) and write the date you checked it.
 
+# Models ticked by default in the web UI (step 1). Start with a free model to learn the flow.
+default_models: ["or-gemma4-31b-free"]
+
 models:
+  # FREE variant (added 2026-09-25) for trying the pipeline at no cost. Caveats: only one
+  # upstream provider (Google AI Studio) and it does NOT state its quantization, so results
+  # must not be pooled with or treated as the paid google/gemma-4-31b-it (bf16 on Novita).
+  # Free tiers are rate limited (rpm kept low) and can be withdrawn at any time.
+  - key: or-gemma4-31b-free
+    provider: openai_compatible
+    model: google/gemma-4-31b-it:free
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 15
+    concurrency: 1
+    temperature: 0.7
+    max_tokens: 2000
+    timeout_s: 180
+    seed_base: 1000
+    extra_body:
+      reasoning:
+        enabled: false
+      provider:
+        order: ["google-ai-studio"]
+        allow_fallbacks: false
+        require_parameters: true
+    note: "OpenRouter google/gemma-4-31b-it:free pinned to Google AI Studio, quantization not stated; $0/M in, $0/M out (checked 2026-09-25); thinking OFF"
+
   # Same family as the earlier local qwen3.5:4b, the smallest Qwen3.5 on OpenRouter.
   # Thinking OFF, as in the local runs (empty-answer problem with thinking on).
   - key: or-qwen35-9b
