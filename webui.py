@@ -49,6 +49,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -2189,6 +2190,46 @@ refresh().then(() => { go(1); if (S.job.running || S.job.argv.length) startPolli
 """
 
 
+def free_port(port: int) -> None:
+    """
+    Stop whatever is listening on 127.0.0.1:`port` (usually an older webui.py left running),
+    so a fresh start always gets the port. SIGTERM first, SIGKILL after 3 s.
+    """
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return  # no lsof: fall through, the bind error below still explains the problem
+    pids = {int(x) for x in out.split() if x.isdigit()} - {os.getpid()}
+    for pid in pids:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout.strip()
+        print(f"port {port} in use by pid {pid} ({cmd or '?'}); stopping it")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + 3
+    while pids and time.time() < deadline:
+        time.sleep(0.1)
+        pids = {pid for pid in pids if _alive(pid)}
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def main() -> int:
     global CONFIG
     ap = argparse.ArgumentParser(description="Local web UI for spike.py")
@@ -2199,12 +2240,13 @@ def main() -> int:
     CONFIG = Path(args.config).resolve()
     if not CONFIG.exists():
         sys.exit(f"Config file not found: {CONFIG}")
+    free_port(args.port)
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
         if exc.errno == 48 or "in use" in str(exc).lower():  # 48 = EADDRINUSE on macOS
-            sys.exit(f"Port {args.port} is already in use (another webui.py still running?).\n"
-                     f"Stop it, or pick another port: python3 webui.py --port {args.port + 1}")
+            sys.exit(f"Port {args.port} is still in use and could not be freed "
+                     f"(owned by another user?). Pick another port: python3 webui.py --port {args.port + 1}")
         raise
     print(f"Bias POC web UI: http://127.0.0.1:{args.port}  (Ctrl+C to stop)")
     if CONFIG != DEFAULT_CONFIG:
