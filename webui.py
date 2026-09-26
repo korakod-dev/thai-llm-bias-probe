@@ -229,6 +229,8 @@ def _validate_and_write(new_text: str) -> None:
             spike.load_models(tmp)
         except SystemExit as exc:  # load_models reports problems via sys.exit(message)
             raise BadRequest(f"config ไม่ผ่านการตรวจ ไม่ได้บันทึก: {exc}")
+        except yaml.YAMLError as exc:  # e.g. an alias whose anchor was in the removed entry
+            raise BadRequest(f"config ใหม่อ่านไม่ได้ ไม่ได้บันทึก: {exc}")
         os.replace(tmp, CONFIG)
     finally:
         if tmp.exists():
@@ -243,30 +245,51 @@ def _q(value: Any) -> str:
 def _hand_written_block(text: str, key: str) -> tuple[int, int]:
     """
     (start, end) character span of the hand-written `models:` list item whose key is `key`,
-    including the comment lines directly above it (no blank line between), so the note that
-    explains a model goes with it. Only handles the layout used in models.yaml: items start
-    with "  - " inside a top-level "models:" section.
+    including the comment lines directly above it, so the note that explains a model goes
+    with it. Item positions come from the YAML parser, so any indentation style works and
+    anchors/aliases shared between items are fine.
     """
-    lines = text.splitlines(keepends=True)
     try:
-        sec = next(i for i, ln in enumerate(lines) if re.match(r"^models:\s*(#.*)?$", ln))
-    except StopIteration:
+        root = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise BadRequest(f"อ่าน config ไม่ได้: {exc}")
+    pair = next(((k, v) for k, v in getattr(root, "value", []) if getattr(k, "value", None) == "models"), None)
+    seq = pair[1] if pair else None
+    if not isinstance(seq, yaml.SequenceNode):
         raise BadRequest("หา models: ในไฟล์ไม่เจอ")
-    sec_end = next((i for i in range(sec + 1, len(lines))
-                    if lines[i].strip() and not lines[i].startswith((" ", "#"))), len(lines))
-    starts = [i for i in range(sec + 1, sec_end) if lines[i].startswith("  - ")]
-    for n, st in enumerate(starts):
-        end = starts[n + 1] if n + 1 < len(starts) else sec_end
-        item = yaml.safe_load("".join(lines[st:end])) or [{}]
-        if not (isinstance(item, list) and isinstance(item[0], dict) and item[0].get("key") == key):
+    if seq.flow_style:
+        raise BadRequest("models เขียนแบบ [ ... ] ในบรรทัดเดียว ลบจากหน้าเว็บไม่ได้ แก้ config/models.yaml เอง")
+    lines = text.splitlines(keepends=True)
+    for item in seq.value:
+        fields = {k.value: v for k, v in getattr(item, "value", []) if isinstance(k, yaml.ScalarNode)}
+        if getattr(fields.get("key"), "value", None) != key:
             continue
-        while st > sec + 1 and lines[st - 1].startswith("  #"):  # comments attached above
+        # start_mark is the line of "- key: ..."; end_mark is where the next item (or the next
+        # top-level key) starts, so comments in between belong to whatever follows.
+        st = item.start_mark.line
+        end = len(lines) if item.end_mark.index >= len(text) else item.end_mark.line
+        is_comment = lambda ln: ln.lstrip().startswith("#")  # noqa: E731
+        if st > 0 and lines[st - 1].strip() == "-":  # "-" alone, keys on the following lines
             st -= 1
-        if n + 1 < len(starts):  # stop before the next item's own leading comments
-            while end - 1 > st and lines[end - 1].startswith("  #"):
-                end -= 1
+        while st - 1 > pair[0].start_mark.line and is_comment(lines[st - 1]) \
+                and "<<< webui-added" not in lines[st - 1]:  # never take another block's end mark
+            st -= 1
+        while end - 1 > item.start_mark.line and is_comment(lines[end - 1]):  # next item's comments
+            end -= 1
         return sum(map(len, lines[:st])), sum(map(len, lines[:end]))
     raise BadRequest("หาบล็อกของโมเดลนี้ในไฟล์ไม่เจอ")
+
+
+def _join(head: str, tail: str) -> str:
+    """head + tail with at most one blank line where they meet. Only the seam is touched, so
+    blank lines elsewhere (for example inside a `note: |` block) stay exactly as written."""
+    h, t = head.rstrip("\n"), tail.lstrip("\n")
+    if not h:
+        return t
+    if not t:
+        return h + "\n"
+    newlines = (len(head) - len(h)) + (len(tail) - len(t))
+    return h + "\n" * min(max(newlines, 1), 2) + t
 
 
 def _drop_default(text: str, key: str) -> str:
@@ -274,8 +297,11 @@ def _drop_default(text: str, key: str) -> str:
     m = re.search(r"^default_models:[ \t]*(\[.*\])[ \t]*$", text, re.M)
     if not m:
         return text
-    keys = yaml.safe_load(m.group(1)) or []
-    if key not in keys:
+    try:
+        keys = yaml.safe_load(m.group(1)) or []
+    except yaml.YAMLError:
+        return text
+    if not isinstance(keys, list) or key not in keys:
         return text
     return text[:m.start()] + "default_models: " + _q([k for k in keys if k != key]) + text[m.end():]
 
@@ -295,14 +321,19 @@ def remove_model(key: str) -> None:
             block = re.compile(
                 rf"^  # >>> webui-added {re.escape(key)} .*?^  # <<< webui-added {re.escape(key)}[ \t]*\n?",
                 re.S | re.M)
-            new_text, n = block.subn("", text)
-            if n != 1:
+            found = list(block.finditer(text))
+            if len(found) != 1:
                 raise BadRequest("หาบล็อกของโมเดลนี้ในไฟล์ไม่เจอ")
+            st, end = found[0].span()
         else:
             st, end = _hand_written_block(text, key)
-            new_text = text[:st] + text[end:]
-        new_text = _drop_default(new_text, key)
-        new_text = re.sub(r"\n{3,}", "\n\n", new_text).rstrip("\n") + "\n"
+        new_text = _drop_default(_join(text[:st], text[end:]), key)
+        try:  # never report success for a removal that did not happen
+            left = [m.get("key") for m in (yaml.safe_load(new_text) or {}).get("models") or []]
+        except (yaml.YAMLError, AttributeError):
+            left = []  # unreadable result: _validate_and_write below refuses it with a message
+        if key in left:
+            raise BadRequest("ลบไม่สำเร็จ: รูปแบบ config แบบนี้ต้องแก้ไฟล์ config/models.yaml เอง")
         _validate_and_write(new_text)
 
 
@@ -2190,23 +2221,69 @@ refresh().then(() => { go(1); if (S.job.running || S.job.argv.length) startPolli
 """
 
 
+def _ps_command(pid: int) -> str:
+    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                          capture_output=True, text=True, timeout=5).stdout.strip()
+
+
+def _is_this_webui(pid: int, cmd: str) -> bool:
+    """True if `pid` runs this very file (not just any script named webui.py)."""
+    me = Path(__file__).resolve()
+    if str(me) in cmd:
+        return True
+    toks = [t for t in cmd.split() if t.endswith("webui.py")]
+    if any(Path(t).resolve() == me for t in toks if t.startswith("/")):  # symlinked or ../ path
+        return True
+    rel = [t for t in toks if not t.startswith("/")]
+    if not rel:
+        return False
+    out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                         capture_output=True, text=True, timeout=5).stdout
+    cwd = next((ln[1:] for ln in out.splitlines() if ln.startswith("n")), None)
+    return bool(cwd) and any((Path(cwd) / t).resolve() == me for t in rel)
+
+
+def _running_job(pid: int) -> Optional[int]:
+    """Pid of a spike.py job started by the webui.py `pid`, if one is still running."""
+    out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    for child in (int(x) for x in out.split() if x.isdigit()):
+        if SPIKE.name in _ps_command(child):
+            return child
+    return None
+
+
 def free_port(port: int) -> None:
     """
-    Stop whatever is listening on 127.0.0.1:`port` (usually an older webui.py left running),
-    so a fresh start always gets the port. SIGTERM first, SIGKILL after 3 s.
+    Stop an older copy of this webui.py listening on `port`, so a fresh start gets the port.
+    Left alone (the bind error below then says so): any other program, and an older copy that
+    is still running a spike.py job, because killing it would orphan the job (it would keep
+    calling the paid API with no page to watch or stop it). SIGTERM first, SIGKILL after 3 s.
     """
     try:
         out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
                              capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.TimeoutExpired):
         return  # no lsof: fall through, the bind error below still explains the problem
-    pids = {int(x) for x in out.split() if x.isdigit()} - {os.getpid()}
-    for pid in pids:
-        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                             capture_output=True, text=True).stdout.strip()
-        print(f"port {port} in use by pid {pid} ({cmd or '?'}); stopping it")
+    pids = set()
+    for pid in {int(x) for x in out.split() if x.isdigit()} - {os.getpid()}:
+        try:
+            cmd = _ps_command(pid)
+            mine = _is_this_webui(pid, cmd)
+            job = _running_job(pid) if mine else None
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if not mine:
+            print(f"port {port} in use by pid {pid} ({cmd or '?'}), not this webui.py; leaving it")
+            continue
+        if job:
+            print(f"port {port} in use by an older webui.py (pid {pid}) that is still running a job "
+                  f"(spike.py pid {job}); leaving it. Stop the job in that page (หยุด) or wait for "
+                  f"it to finish, then start again.")
+            continue
+        print(f"port {port} in use by an older webui.py (pid {pid}); stopping it")
         try:
             os.kill(pid, signal.SIGTERM)
+            pids.add(pid)
         except ProcessLookupError:
             pass
     deadline = time.time() + 3
@@ -2245,8 +2322,8 @@ def main() -> int:
         srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
         if exc.errno == 48 or "in use" in str(exc).lower():  # 48 = EADDRINUSE on macOS
-            sys.exit(f"Port {args.port} is still in use and could not be freed "
-                     f"(owned by another user?). Pick another port: python3 webui.py --port {args.port + 1}")
+            sys.exit(f"Port {args.port} is still in use (see above). "
+                     f"Pick another port: python3 webui.py --port {args.port + 1}")
         raise
     print(f"Bias POC web UI: http://127.0.0.1:{args.port}  (Ctrl+C to stop)")
     if CONFIG != DEFAULT_CONFIG:
