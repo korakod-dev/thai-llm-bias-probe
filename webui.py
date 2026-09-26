@@ -77,6 +77,8 @@ DEFAULT_CONFIG = ROOT / "config" / "models.yaml"
 CONFIG = DEFAULT_CONFIG                         # overridden by --config in main()
 CONFIG_LOCK = threading.Lock()
 DBS = {"real": ROOT / "bias_poc.db", "dry": ROOT / "bias_poc_dry.db"}
+STATIC = ROOT / "static"                         # 3D scene, sound effects, vendored three.js
+STATIC_TYPES = {".js": "text/javascript; charset=utf-8", ".txt": "text/plain; charset=utf-8"}
 TOKEN = secrets.token_urlsafe(24)               # new on every start; embedded in the page only
 
 OPENROUTER_API = "https://openrouter.ai/api/v1"
@@ -1220,11 +1222,12 @@ class Handler(BaseHTTPRequestHandler):
     def _token_ok(self) -> bool:
         return secrets.compare_digest(self.headers.get("X-Token", ""), TOKEN)
 
-    def _send(self, status: int, body: bytes, ctype: str, extra: Optional[dict] = None) -> None:
+    def _send(self, status: int, body: bytes, ctype: str, extra: Optional[dict] = None,
+              cache: str = "no-store") -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
@@ -1245,6 +1248,16 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             html = PAGE.replace("__TOKEN__", TOKEN).encode("utf-8")
             return self._send(200, html, "text/html; charset=utf-8")
+        if url.path.startswith("/static/"):
+            # Only regular .js/.txt files inside static/ (no directory listing, no escaping it).
+            f = (STATIC / url.path[len("/static/"):]).resolve()
+            if STATIC not in f.parents or not f.is_file() or f.suffix not in STATIC_TYPES:
+                return self._send(404, b"not found", "text/plain")
+            # static/vendor/<name>-<version>/ never changes (an upgrade gets a new folder and a
+            # new URL), so the browser may keep it; our own scripts are always re-read.
+            vendored = STATIC / "vendor" in f.parents
+            return self._send(200, f.read_bytes(), STATIC_TYPES[f.suffix],
+                              cache="max-age=31536000, immutable" if vendored else "no-store")
         if url.path == "/api/state":
             return self._json(state())
         if url.path == "/api/job":
@@ -1329,7 +1342,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ----------------------------------------------------------------------------------------
-# Page (single file; no external resources)
+# Page (no external resources; the optional 3D scene and sounds are served from static/)
 # ----------------------------------------------------------------------------------------
 PAGE = r"""<!doctype html>
 <html lang="th">
@@ -1337,6 +1350,23 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bias POC Runner</title>
+<script>
+// 3D view unless: no WebGL2, the OS asks for reduced motion (and 3D was not picked by hand),
+// or 2D was picked with the toggle. Decided before first paint so the layout does not jump.
+(() => {
+  let pref = null; try { pref = localStorage.getItem("bias_view"); } catch (e) {}
+  let gl = false;
+  try {
+    const x = document.createElement("canvas").getContext("webgl2"); gl = !!x;
+    const lose = x && x.getExtension("WEBGL_lose_context"); if (lose) lose.loseContext();
+  } catch (e) {}
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  document.documentElement.dataset.gl = gl ? "1" : "";
+  if (gl && pref !== "2d" && (!reduce || pref === "3d")) document.documentElement.classList.add("three");
+})();
+</script>
+<script type="importmap">{"imports": {"three": "/static/vendor/three-0.186.1/build/three.module.js", "three/addons/": "/static/vendor/three-0.186.1/addons/"}}</script>
+<script src="/static/sfx.js"></script>
 <style>
 :root {
   --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
@@ -1476,19 +1506,85 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
 .mono { font: 12.5px ui-monospace, Menlo, monospace; word-break: break-all; }
 .grid2 { display: grid; gap: 14px; grid-template-columns: 1fr; }
 @media (min-width: 900px) { .grid2 { grid-template-columns: 1.2fr 1fr; } }
+.tool { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+html:not([data-gl="1"]) #view_toggle { display: none; }
+
+/* ----------------------------- 3D mode (html.three, see static/scene3d.js) ----------------------------- */
+#scene, #labels { display: none; }
+html:not(.three) [data-step="hub"], html:not(.three) [data-panel="hub"] { display: none !important; }
+html.three {
+  --bg: #04060c; --panel: rgba(13, 18, 31, .8); --ink: #e9edf5; --muted: #9aa5b8; --line: rgba(148, 170, 210, .2);
+  --accent: #7fb6ff; --accent-ink: #06121f; --accent-soft: rgba(127, 182, 255, .15);
+  --ok: #6cc28f; --ok-soft: rgba(108, 194, 143, .15); --warn: #f0b060; --warn-soft: rgba(240, 176, 96, .15);
+  --bad: #f08a80; --bad-soft: rgba(240, 138, 128, .15);
+  --code-bg: rgba(2, 4, 9, .85); --code-ink: #dfe6f2; --hover: rgba(127, 182, 255, .09);
+  color-scheme: dark;
+}
+html.three body { background: var(--bg); }
+html.three #scene { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 0; }
+html.three #labels { display: block; position: fixed; inset: 0; z-index: 1; pointer-events: none; overflow: hidden; }
+html.three main { position: relative; z-index: 2; max-width: none; padding: 18px 28px 80px; pointer-events: none; }
+html.three main > * { pointer-events: auto; }
+html.three .top { pointer-events: none; }
+html.three .top > * { pointer-events: auto; }
+html.three h1 { text-shadow: 0 0 26px rgba(127, 182, 255, .45); }
+html.three input[type=text], html.three input[type=number], html.three input[type=search], html.three select, html.three textarea {
+  background: rgba(3, 5, 10, .55); }
+html.three .card, html.three .steps button, html.three .choice {
+  background: var(--panel); border-color: var(--line);
+  -webkit-backdrop-filter: blur(18px) saturate(1.3); backdrop-filter: blur(18px) saturate(1.3); }
+html.three .choice:has(input:checked) { background: rgba(40, 72, 120, .5); border-color: var(--accent); }
+html.three .steps { pointer-events: none; }
+html.three .steps button { pointer-events: auto; }
+html.three .steps button.on { background: rgba(40, 72, 120, .6); box-shadow: 0 0 20px rgba(127, 182, 255, .25); }
+html.three .card[data-panel] { box-shadow: 0 24px 70px rgba(0, 0, 0, .5), inset 0 1px 0 rgba(255, 255, 255, .06);
+  animation: panelIn .6s cubic-bezier(.2, .8, .2, 1) .15s both; }
+@keyframes panelIn { from { opacity: 0; transform: translateY(24px) scale(.985); } to { opacity: 1; transform: none; } }
+@media (min-width: 1000px) {
+  html.three .card[data-panel] { width: min(680px, 48vw); margin-left: auto; animation-name: panelInSide; }
+  @keyframes panelInSide { from { opacity: 0; transform: translateX(48px); } to { opacity: 1; transform: none; } }
+}
+@media (max-width: 999px) {
+  html.three main { padding: 14px 16px 60px; }
+  html.three .card[data-panel] { margin-top: 34vh; }
+}
+html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); width: auto;
+  max-width: calc(100vw - 32px); margin: 0; padding: 10px 18px; text-align: center; font-size: 14px; color: var(--muted);
+  animation: hubIn 1s ease .9s both; }
+@keyframes hubIn { from { opacity: 0; } to { opacity: 1; } }
+.l3 { position: absolute; left: 0; top: 0; pointer-events: auto; display: flex; align-items: center; gap: 8px;
+  padding: 5px 13px 5px 5px; border-radius: 99px; background: rgba(9, 13, 23, .74); color: #dfe6f2;
+  border: 1px solid rgba(148, 170, 210, .24); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  font-size: 13.5px; white-space: nowrap; will-change: transform; transition: border-color .2s, background .2s, box-shadow .2s; }
+.l3 .n { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 99px;
+  border: 1.5px solid currentColor; font-size: 12px; font-weight: 700; flex: none; }
+.l3 .s { font-size: 12px; color: var(--muted); }
+.l3 .s:empty { display: none; }
+.l3:hover { border-color: var(--accent); }
+.l3.on { border-color: var(--accent); background: rgba(40, 72, 120, .6); box-shadow: 0 0 24px rgba(127, 182, 255, .4); color: #fff; }
+.l3.done .n { background: var(--ok); border-color: var(--ok); color: #06140c; }
+.l3.done .s { color: var(--ok); }
+.l3.run .s { color: var(--warn); }
 </style>
 </head>
 <body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<div id="labels"></div>
 <main>
   <div class="top">
     <div>
       <h1>Bias POC — ทดสอบอคติของโมเดล AI</h1>
       <div class="sub">ถามคำถามเดียวกันโดยเปลี่ยนแค่กลุ่มของคน แล้วดูว่าโมเดลเลือกต่างกันไหม · ผลทั้งหมดเป็นแบบสำรวจ (exploratory)</div>
     </div>
-    <div class="chips" id="status_chips"></div>
+    <div class="tool">
+      <div class="chips" id="status_chips"></div>
+      <button class="ghost small" id="sfx_toggle" data-sfx="none"></button>
+      <button class="ghost small" id="view_toggle" data-sfx="none"></button>
+    </div>
   </div>
 
   <nav class="steps" id="steps">
+    <button data-step="hub" class="adv"><span class="n">◎</span>ภาพรวม</button>
     <button data-step="1"><span class="n">1</span>เลือกโมเดล</button>
     <button data-step="2"><span class="n">2</span>ชุดคำถาม</button>
     <button data-step="3"><span class="n">3</span>รัน</button>
@@ -1496,6 +1592,11 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
     <button data-step="5"><span class="n">5</span>สรุป & เทียบ</button>
     <button data-step="adv" class="adv"><span class="n">⚙</span>ขั้นสูง</button>
   </nav>
+
+  <!-- ======================= 3D OVERVIEW (3D mode only) ======================= -->
+  <section class="card hubnote" data-panel="hub" hidden>
+    <b style="color:var(--ink)">ภาพรวม</b> · คลิกวัตถุหรือป้ายชื่อเพื่อเข้าไปในแต่ละขั้นตอน · กดปุ่ม ◎ ภาพรวม ด้านบนเพื่อกลับมาที่นี่
+  </section>
 
   <!-- ======================= STEP 1: MODELS ======================= -->
   <section class="card" data-panel="1">
@@ -1600,8 +1701,8 @@ tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; paddi
         <div class="qa expected"><div class="qlabel">เฉลย</div><div id="l_exp" class="qtext"></div></div>
         <div class="qa"><div class="qlabel">คำตอบของโมเดล</div><div id="l_resp" class="qtext resp"></div></div>
         <div class="row">
-          <button class="okbtn" id="l_y">✓ ถูก <span class="kbd">Y</span></button>
-          <button class="badbtn" id="l_n">✗ ผิด <span class="kbd">N</span></button>
+          <button class="okbtn" id="l_y" data-sfx="none">✓ ถูก <span class="kbd">Y</span></button>
+          <button class="badbtn" id="l_n" data-sfx="none">✗ ผิด <span class="kbd">N</span></button>
           <button class="ghost" id="l_prev">← ก่อนหน้า</button>
           <button class="ghost" id="l_next">ข้าม →</button>
           <span id="l_cur" class="pill muted"></span>
@@ -1683,6 +1784,19 @@ let SEL = null;        // Set of ticked model keys
 let QSET = null;       // selected question-set file
 let CUR = null;        // "db|run_id" of the run being reviewed/summarised
 let outLen = 0, polling = null, lastJob = null;
+let sawRunning = false;  // this page saw the job running (so "finished" is news, worth a sound)
+let DONE = {};         // which steps are complete (for the 3D scene)
+let JOBINFO = {};      // job progress (for the 3D scene)
+const three = () => document.documentElement.classList.contains("three");
+const sfx = (name, ...a) => { try { window.SFX && SFX[name] && SFX[name](...a); } catch (e) {} };
+const emit = (name, detail) => window.dispatchEvent(new CustomEvent(name, {detail}));
+window.biasState = () => ({step: STEP, done: DONE, job: JOBINFO});
+window.disable3D = (err) => {   // called by static/scene3d.js if it cannot start
+  document.documentElement.classList.remove("three", "three-ready");
+  if (STEP === "hub") go(1);
+  renderToggles();
+  if (err) console.warn("3D view off:", err);
+};
 
 async function api(path, body) {
   const opt = {headers: {"X-Token": TOKEN}};
@@ -1704,11 +1818,35 @@ function go(step) {
   if (STEP === "5") { fillRunSelect("r5"); loadSummary(); }
   if (STEP === "adv") renderAdvanced();
   window.scrollTo({top: 0, behavior: "smooth"});
+  emit("bias:step", {step: STEP});
 }
 function markDone() {
-  const done = {"1": SEL && SEL.size > 0, "2": !!QSET, "3": !!CUR};
+  const done = {"1": !!(SEL && SEL.size > 0), "2": !!QSET, "3": !!CUR};
   document.querySelectorAll("#steps button").forEach(b => b.classList.toggle("done", !!done[b.dataset.step]));
+  DONE = done; emit("bias:done", done);
 }
+
+/* ----------------------------- sound + view toggles ----------------------------- */
+function renderToggles() {
+  $("sfx_toggle").textContent = window.SFX && SFX.muted ? "🔇 เสียงปิด" : "🔊 เสียงเปิด";
+  $("sfx_toggle").hidden = !window.SFX;
+  $("view_toggle").textContent = three() ? "มุมมอง 2D" : "มุมมอง 3D";
+}
+$("sfx_toggle").addEventListener("click", () => {
+  SFX.setMuted(!SFX.muted); if (!SFX.muted) sfx("click"); renderToggles();
+});
+$("view_toggle").addEventListener("click", () => { store.set("bias_view", three() ? "2d" : "3d"); location.reload(); });
+// A soft click for every button / choice / dropdown / checkbox. Clicking a label's text also
+// fires a second, synthetic click on its input right after; skip it so one click = one sound.
+let lastClickSfx = -1e9;
+document.addEventListener("click", e => {
+  const el = e.target.closest("button, .choice, summary, select, input[type=checkbox], label:has(input[type=checkbox])");
+  if (!el || el.closest("#labels") || e.timeStamp - lastClickSfx < 60) return;
+  const k = el.dataset.sfx || (el.closest("[data-sfx]") || {dataset: {}}).dataset.sfx;
+  if (k === "none") return;
+  lastClickSfx = e.timeStamp;
+  sfx(k || "click");
+}, true);
 
 /* ----------------------------- state ----------------------------- */
 async function refresh() {
@@ -1841,13 +1979,15 @@ async function poll() {
     outLen = j.length;
   }
   lastJob = j;
+  if (j.running) sawRunning = true;
   const cmdline = j.argv.length ? "python3 spike.py " + j.argv.join(" ") : "";
   $("job_cmd").textContent = cmdline; $("a_cmdline").textContent = cmdline;
   const isRun = j.argv[0] === "run";
   // progress from spike.py lines like "[12/34] model prompt ok"
   const m = [...$("out").textContent.matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
+  const k = m ? +m[1] : 0, n = m ? +m[2] : 0;
+  JOBINFO = {running: j.running, k, n, exit: j.exit_code, isRun}; emit("bias:job", JOBINFO);
   if (isRun) {
-    const k = m ? +m[1] : 0, n = m ? +m[2] : 0;
     $("prog").querySelector("div").style.width = n ? (100 * k / n) + "%" : (j.running ? "3%" : "0");
     $("prog_txt").textContent = j.running ? (n ? `กำลังรัน ${k}/${n} …` : "กำลังเริ่ม…") : "";
   }
@@ -1863,8 +2003,10 @@ async function poll() {
   $("prog").classList.toggle("done", !j.running && j.exit_code === 0 && isRun);
   if (!j.running && polling) {
     clearInterval(polling); polling = null;
+    const heard = sawRunning; sawRunning = false;
     await refresh();
     if (isRun) {
+      if (heard) sfx(j.exit_code === 0 ? "success" : j.exit_code < 0 ? "bad" : "error");
       const ok = /Finished: (\d+) ok, (\d+) failed/.exec($("out").textContent);
       const failed = ok ? +ok[2] : null;
       $("run_done").hidden = false;
@@ -1987,11 +2129,12 @@ async function saveLabel(value) {
   try {
     await saveNote();
     const r = await api("/api/label/set", {db: L.db, run_id: L.run_id, gen_id: it.gen_id, field: L.field, value});
+    if (value) sfx(value === "y" ? "ok" : "bad");   // only once it is saved
     it.label = r.value; it.n_history = r.n_history;
     if (value !== null && gotoNext(L.i) === false) L.i = L.items.indexOf(it);
     renderLabel();
     if (lDone() === L.items.length) loadReviewTodoOnly();
-  } catch (e) { $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  } catch (e) { sfx("error"); $("l_msg").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
 }
 async function loadReviewTodoOnly() {
   const [db, run_id] = splitRun($("r4").value);
@@ -2214,7 +2357,13 @@ $("detail_body").addEventListener("click", async e => {
 
 /* ----------------------------- boot ----------------------------- */
 $("steps").addEventListener("click", e => { const b = e.target.closest("button[data-step]"); if (b) go(b.dataset.step); });
-refresh().then(() => { go(1); if (S.job.running || S.job.argv.length) startPolling(); });
+renderToggles();
+refresh().then(() => { go(three() ? "hub" : 1); if (S.job.running || S.job.argv.length) startPolling(); });
+</script>
+<script type="module">
+// The 3D scene is loaded only in 3D mode, so the 2D page never downloads three.js.
+if (document.documentElement.classList.contains("three"))
+  import("/static/scene3d.js").catch(err => window.disable3D(err));
 </script>
 </body>
 </html>
