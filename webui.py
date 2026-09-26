@@ -88,7 +88,7 @@ LABEL_CSV_RE = re.compile(r"^(v3|spike)-[A-Za-z0-9._-]{1,80}\.csv$")  # same pat
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}/[A-Za-z0-9._:-]{1,96}$")  # author/slug[:variant]
 MODEL_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-MARK_RE = re.compile(r"^  # >>> webui-added (\S+) .*$", re.M)  # marks entries this UI may remove
+MARK_RE = re.compile(r"^  # >>> webui-added (\S+) .*$", re.M)  # marks blocks this UI added
 PRICE_NOTE_RE = re.compile(r"\$([0-9.]+)/M in, \$([0-9.]+)/M out")  # how notes record the price
 MAX_OUTPUT_CHARS = 2_000_000                    # keep the in-memory log bounded
 
@@ -198,7 +198,6 @@ def load_models() -> list[dict]:
         data = yaml.safe_load(read_config_text()) or {}
     except yaml.YAMLError:
         return []
-    removable = set(MARK_RE.findall(read_config_text()))
     out = []
     for m in data.get("models", []):
         env_name = m.get("api_key_env")
@@ -209,7 +208,6 @@ def load_models() -> list[dict]:
             "note": m.get("note"),
             "api_key_env": env_name,
             "key_set": bool(env_name and os.environ.get(env_name)),
-            "removable": m.get("key") in removable,
             "price_in": p_in,
             "price_out": p_out,
             "max_tokens": m.get("max_tokens", 600),
@@ -241,19 +239,68 @@ def _q(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _hand_written_block(text: str, key: str) -> tuple[int, int]:
+    """
+    (start, end) character span of the hand-written `models:` list item whose key is `key`,
+    including the comment lines directly above it (no blank line between), so the note that
+    explains a model goes with it. Only handles the layout used in models.yaml: items start
+    with "  - " inside a top-level "models:" section.
+    """
+    lines = text.splitlines(keepends=True)
+    try:
+        sec = next(i for i, ln in enumerate(lines) if re.match(r"^models:\s*(#.*)?$", ln))
+    except StopIteration:
+        raise BadRequest("หา models: ในไฟล์ไม่เจอ")
+    sec_end = next((i for i in range(sec + 1, len(lines))
+                    if lines[i].strip() and not lines[i].startswith((" ", "#"))), len(lines))
+    starts = [i for i in range(sec + 1, sec_end) if lines[i].startswith("  - ")]
+    for n, st in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else sec_end
+        item = yaml.safe_load("".join(lines[st:end])) or [{}]
+        if not (isinstance(item, list) and isinstance(item[0], dict) and item[0].get("key") == key):
+            continue
+        while st > sec + 1 and lines[st - 1].startswith("  #"):  # comments attached above
+            st -= 1
+        if n + 1 < len(starts):  # stop before the next item's own leading comments
+            while end - 1 > st and lines[end - 1].startswith("  #"):
+                end -= 1
+        return sum(map(len, lines[:st])), sum(map(len, lines[:end]))
+    raise BadRequest("หาบล็อกของโมเดลนี้ในไฟล์ไม่เจอ")
+
+
+def _drop_default(text: str, key: str) -> str:
+    """Remove `key` from a one-line `default_models: [...]`, if it is listed there."""
+    m = re.search(r"^default_models:[ \t]*(\[.*\])[ \t]*$", text, re.M)
+    if not m:
+        return text
+    keys = yaml.safe_load(m.group(1)) or []
+    if key not in keys:
+        return text
+    return text[:m.start()] + "default_models: " + _q([k for k in keys if k != key]) + text[m.end():]
+
+
 def remove_model(key: str) -> None:
+    """
+    Remove one model from the config: a block this UI added (between its >>>/<<< marks) or a
+    hand-written entry (with the comments directly above it). Other comments are kept.
+    """
     if not MODEL_KEY_RE.match(key):
         raise BadRequest("key ไม่ถูกรูปแบบ")
     with CONFIG_LOCK:
         text = read_config_text()
-        if key not in set(MARK_RE.findall(text)):
-            raise BadRequest("ลบได้เฉพาะโมเดลที่เพิ่มผ่านหน้าเว็บนี้ (โมเดลหลักลบไม่ได้)")
-        block = re.compile(
-            rf"^  # >>> webui-added {re.escape(key)} .*?^  # <<< webui-added {re.escape(key)}[ \t]*\n?",
-            re.S | re.M)
-        new_text, n = block.subn("", text)
-        if n != 1:
-            raise BadRequest("หาบล็อกของโมเดลนี้ในไฟล์ไม่เจอ")
+        if [m["key"] for m in load_models()] == [key]:
+            raise BadRequest("ลบโมเดลสุดท้ายไม่ได้ ต้องมีอย่างน้อย 1 โมเดลใน config")
+        if key in set(MARK_RE.findall(text)):
+            block = re.compile(
+                rf"^  # >>> webui-added {re.escape(key)} .*?^  # <<< webui-added {re.escape(key)}[ \t]*\n?",
+                re.S | re.M)
+            new_text, n = block.subn("", text)
+            if n != 1:
+                raise BadRequest("หาบล็อกของโมเดลนี้ในไฟล์ไม่เจอ")
+        else:
+            st, end = _hand_written_block(text, key)
+            new_text = text[:st] + text[end:]
+        new_text = _drop_default(new_text, key)
         new_text = re.sub(r"\n{3,}", "\n\n", new_text).rstrip("\n") + "\n"
         _validate_and_write(new_text)
 
@@ -1661,7 +1708,7 @@ function renderModels() {
       <div class="t">${esc(m.key)}</div><div class="d mono">${esc(m.model)}</div>
       <div class="meta">${free ? '<span class="tag g">ฟรี</span>' : m.price_in != null ? `<span class="tag">${price(m.price_in)} / ${price(m.price_out)} ต่อล้าน token</span>` : ""}
       ${m.key_set ? "" : '<span class="tag b">ไม่มี API key</span>'}
-      ${m.removable ? `<button class="ghost small" data-remove="${esc(m.key)}">ลบ</button>` : ""}</div></label>`;
+      <button class="ghost small" data-remove="${esc(m.key)}">ลบ</button></div></label>`;
   }).join("") || `<p class="muted">ยังไม่มีโมเดล กด "+ เพิ่มโมเดล"</p>`;
 }
 $("model_cards").addEventListener("change", () => {
@@ -1671,7 +1718,7 @@ $("model_cards").addEventListener("change", () => {
 $("model_cards").addEventListener("click", async e => {
   const k = e.target.dataset.remove; if (!k) return;
   e.preventDefault();
-  if (!confirm(`ลบ ${k} ออกจาก config?\nผลของ run เก่ายังอยู่`)) return;
+  if (!confirm(`ลบ ${k} ออกจาก config/models.yaml?\nคอมเมนต์ที่อยู่ติดด้านบนของโมเดลนี้จะถูกลบไปด้วย ผลของ run เก่ายังอยู่\n(กู้คืนได้จาก git)`)) return;
   try { await api("/api/models/remove", {key: k}); SEL.delete(k); await refresh(); } catch (err) { alert(err.message); }
 });
 $("to2").addEventListener("click", () => { if (!SEL.size) return alert("เลือกอย่างน้อย 1 โมเดล"); go(2); });
