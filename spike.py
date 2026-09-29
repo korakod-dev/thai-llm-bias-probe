@@ -568,6 +568,27 @@ def _parse_retry_after(resp: httpx.Response) -> Optional[float]:
         return None
 
 
+def _describe_http_error(resp: httpx.Response) -> tuple[str, Optional[dict]]:
+    """Readable one-line message for a failed HTTP call, plus the parsed body (if JSON).
+    OpenRouter wraps the upstream reason in error.metadata.raw; surface it instead of the
+    generic "Provider returned error"."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return f"HTTP {resp.status_code}: {resp.text}", None
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        return f"HTTP {resp.status_code}: {json.dumps(data, ensure_ascii=False)}", data
+    meta = err.get("metadata") if isinstance(err.get("metadata"), dict) else {}
+    upstream = meta.get("raw")
+    if upstream is not None and not isinstance(upstream, str):
+        upstream = json.dumps(upstream, ensure_ascii=False)
+    provider = meta.get("provider_name")
+    head = f"HTTP {resp.status_code}" + (f" ({provider})" if provider else "")
+    detail = " | ".join(p for p in (err.get("message"), upstream) if p)
+    return f"{head}: {detail or json.dumps(data, ensure_ascii=False)}", data
+
+
 async def _post_json(client: httpx.AsyncClient, url: str, headers: dict, body: dict,
                      timeout_s: float):
     """POST and classify failures: 429/5xx/network/timeout -> retryable; other 4xx -> permanent."""
@@ -578,13 +599,12 @@ async def _post_json(client: httpx.AsyncClient, url: str, headers: dict, body: d
         raise CallError(f"transport error: {type(exc).__name__}: {exc}", retryable=True)
     latency_ms = int((time.monotonic() - started) * 1000)
 
-    if resp.status_code == 429 or resp.status_code >= 500:
-        raise CallError(f"HTTP {resp.status_code}: {resp.text[:300]}",
-                        http_status=resp.status_code, retryable=True,
-                        retry_after=_parse_retry_after(resp))
     if resp.status_code >= 400:
-        raise CallError(f"HTTP {resp.status_code}: {resp.text[:500]}",
-                        http_status=resp.status_code, retryable=False)
+        message, error_body = _describe_http_error(resp)
+        retryable = resp.status_code == 429 or resp.status_code >= 500
+        raise CallError(message, http_status=resp.status_code, retryable=retryable,
+                        retry_after=_parse_retry_after(resp) if retryable else None,
+                        raw=error_body)
     try:
         data = resp.json()
     except ValueError:
@@ -777,7 +797,7 @@ async def execute_call(ctx: RunContext, m: ModelCfg, prompt: dict, sample_idx: i
     ctx.done += 1
     ctx.failed += 1
     print(f"[{ctx.done}/{ctx.total}] {m.key:<18} {prompt['id']}#{sample_idx} "
-          f"ERROR after {attempts} attempts: {str(last_error)[:120]}", flush=True)
+          f"ERROR after {attempts} attempts: {last_error}", flush=True)
     return False
 
 
