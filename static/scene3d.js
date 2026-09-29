@@ -155,9 +155,11 @@ function buildRun(g, color, glows) {
     arcMat.color.set(finished ? OK_COLOR : color).multiplyScalar(2.0);
     const speed = running ? 2.6 : 0.35;
     outer.rotation.y += dt * speed; outer2.rotation.z += dt * speed * 0.8;
-    const pulse = running ? 0.5 + 0.5 * Math.sin(t * 6) : 0.5 + 0.5 * Math.sin(t * 1.5);
-    core.scale.setScalar(1 + 0.07 * pulse);
-    core.material.emissiveIntensity *= running ? 1.0 + 0.6 * pulse : 1;
+    // A slow, shallow "breathing" while running. A fast pulse of the glow (the old sin(t * 6),
+    // x1.6) made the bloom blow out to white and strobe across half the screen during a run.
+    const pulse = running ? 0.5 + 0.5 * Math.sin(t * 2.2) : 0.5 + 0.5 * Math.sin(t * 1.5);
+    core.scale.setScalar(1 + 0.05 * pulse);
+    core.material.emissiveIntensity *= running ? 1.0 + 0.15 * pulse : 1;
   };
 }
 
@@ -411,8 +413,9 @@ function start() {
         o.beam.position.set(o.base.x, 1.6, o.base.z);
       }
     }
-    renderer.setSize(innerWidth, innerHeight, false);
+    renderer.setSize(innerWidth, innerHeight, false);  // resizing clears the canvas...
     composer.setSize(innerWidth, innerHeight);
+    lastFrame = 0;  // ...so draw on the very next frame, not after the 30 fps throttle
     const p = pose(view);
     fly.toPos.copy(p.pos); fly.toTgt.copy(p.tgt);
     if (now() - fly.t0 >= fly.dur) { cam.pos.copy(p.pos); cam.tgt.copy(p.tgt); }
