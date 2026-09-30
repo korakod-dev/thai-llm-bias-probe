@@ -1714,7 +1714,7 @@ tr.grp td { background: var(--bg); font-weight: 600; font-size: 12px; padding: 6
       <span><span class="tag g">เอนน้อยสุด</span> เอนน้อยกว่าทุกโมเดลอย่างชัดเจน</span>
       <span><span class="tag b">เอนมากสุด</span> เอนมากกว่าทุกโมเดลอย่างชัดเจน</span>
       <span><span class="tag">ใกล้เคียง</span> แยกไม่ออกจากโมเดลอื่น</span>
-      <span><span class="tag w">ห้ามตีความ</span> ไม่ผ่านข้อสอบควบคุม</span>
+      <span><span class="tag w">ห้ามตีความ</span> ไม่ผ่านข้อสอบควบคุม หรือ template น้อยกว่าเกณฑ์</span>
     </div>
     <div class="row"><button class="ghost" data-go="4">← กลับ</button></div>
   </section>
@@ -1793,7 +1793,9 @@ function go(step) {
   history.replaceState(null, "", "#" + STEP);   // reload stays on this step
 }
 // A step gets its green tick only for something done in THIS session: 1/2 when the choice is
-// confirmed ("ถัดไป" or starting a run), 3 when a run started here finishes without error.
+// confirmed ("ถัดไป" or starting a run), 3 when a run started here finishes without error,
+// 4 when the run opened in step 4/5 has nothing left that a human must confirm, 5 when its
+// summary was opened with the run complete and step 4 clear.
 // Preselected defaults and runs from earlier sessions do not count. Kept in sessionStorage with
 // the server's per-start token (together with the ticked models, question set and run options),
 // so a page refresh keeps them but a server restart (or a new tab) starts from the defaults
@@ -1814,8 +1816,12 @@ function saveSession() {
   } catch (e) {}
 }
 function setDone(step, v) { DONE[step] = !!v; saveSession(); markDone(); }
+// Something a human can still act on (rerun / label). A final control-gate FAIL is a result,
+// not a pending task, so it does not hold back the tick of step 4.
+const pendingHuman = (s) => s.todo.some(t => t.level === "must" && t.action);
+function newExperiment() { DONE["4"] = DONE["5"] = false; setDone("3", false); }   // different models / set / run
 function markDone() {
-  const done = {"1": DONE["1"] && !!(SEL && SEL.size > 0), "2": DONE["2"] && !!QSET, "3": DONE["3"]};
+  const done = {"1": DONE["1"] && !!(SEL && SEL.size > 0), "2": DONE["2"] && !!QSET, "3": DONE["3"], "4": DONE["4"], "5": DONE["5"]};
   document.querySelectorAll("#steps button").forEach(b => b.classList.toggle("done", !!done[b.dataset.step]));
 }
 
@@ -1874,14 +1880,14 @@ function renderModels() {
   }).join("") || `<p class="muted">ยังไม่มีโมเดล กด "+ เพิ่มโมเดล"</p>`;
 }
 $("model_cards").addEventListener("change", () => {
-  SEL = new Set([...document.querySelectorAll('input[name=mk]:checked')].map(x => x.value)); setDone("3", false);
+  SEL = new Set([...document.querySelectorAll('input[name=mk]:checked')].map(x => x.value)); newExperiment();
   $("run_id").dataset.auto = "1";   // different models = a different experiment = a new run name
 });
 $("model_cards").addEventListener("click", async e => {
   const k = e.target.dataset.remove; if (!k) return;
   e.preventDefault();
   if (!confirm(`ลบ ${k} ออกจาก config/models.yaml?\nคอมเมนต์ที่อยู่ติดด้านบนของโมเดลนี้จะถูกลบไปด้วย ผลของ run เก่ายังอยู่\n(กู้คืนได้จาก git)`)) return;
-  try { await api("/api/models/remove", {key: k}); SEL.delete(k); setDone("3", false); await refresh(); } catch (err) { alert(err.message); }
+  try { await api("/api/models/remove", {key: k}); SEL.delete(k); newExperiment(); await refresh(); } catch (err) { alert(err.message); }
 });
 $("to2").addEventListener("click", () => { if (!SEL.size) return alert("เลือกอย่างน้อย 1 โมเดล"); setDone("1", true); go(2); });
 
@@ -1896,7 +1902,7 @@ function renderQsets() {
 }
 $("qset_cards").addEventListener("change", () => {
   QSET = (document.querySelector('input[name=qs]:checked') || {}).value;
-  $("samples").value = QSET === "prompts_v3.jsonl" ? "3" : "1"; setDone("3", false);
+  $("samples").value = QSET === "prompts_v3.jsonl" ? "3" : "1"; newExperiment();
   $("run_id").dataset.auto = "1";
 });
 $("to3").addEventListener("click", () => { if (!QSET) return alert("เลือกชุดคำถาม"); setDone("2", true); go(3); });
@@ -1948,7 +1954,7 @@ $("go").addEventListener("click", async () => {
   try {
     await api("/api/job", req);
     CUR = (req.dry_run ? "dry" : "real") + "|" + req.run_id; store.set("bias_last_run", CUR);
-    setDone("1", true); setDone("2", true); setDone("3", false);
+    newExperiment(); setDone("1", true); setDone("2", true);
     sawRunning = true;   // started here: its end is news even if it finishes before the first poll
     outLen = 0; $("out").textContent = ""; $("a_out").textContent = ""; $("run_done").hidden = true;
     // Keep this name after the run: pressing "เริ่มรัน" again RESUMES it (only missing/failed
@@ -2049,6 +2055,7 @@ function renderTodo(s) {
   const btn = (t) => t.action === "label" ? `<button class="small" data-act="label">ติดป้ายด้านล่าง ↓</button>`
     : t.action === "rerun" ? `<button class="small" data-act="rerun" data-model="${esc(t.model)}">รันต่อ / ลองใหม่</button>`
     : t.action === "show" ? `<button class="small ghost" data-act="show" data-model="${esc(t.model)}">เปิดอ่าน</button>` : "";
+  setDone("4", !pendingHuman(s));
   $("todo").innerHTML = s.todo.map(t => `<li class="${t.level}"><span class="ic">${icon[t.level]}</span><span class="tx">${esc(t.text)}</span>${btn(t)}</li>`).join("");
 }
 $("todo").addEventListener("click", async e => {
@@ -2180,8 +2187,11 @@ function leanText(r) {
   if (!r || !r.n) return `<span class="muted">ไม่มีข้อมูล</span>`;
   const clear = !(r.lo <= 0.5 && r.hi >= 0.5);
   const toward = r.share1 > 0.5 ? r.group1_th : r.group2_th;
+  // Too few independent templates (pre-registered minimum): show the numbers, state no verdict.
+  const verdict = r.enough === false ? `<div class="muted" style="font-size:12.5px">template ไม่พอ ยังสรุปไม่ได้</div>`
+    : `<div class="${clear ? "bad" : "muted"}" style="font-size:12.5px">${clear ? `เอนไปทาง ${esc(toward)} ชัดเจน` : "ไม่พบการเอนเอียงชัดเจน"}</div>`;
   return `<div class="lean">${leanBar(r.lo, r.hi, r.share1)}<span class="l1">${pct(r.share1)}</span></div>
-    <div class="${clear ? "bad" : "muted"}" style="font-size:12.5px">${clear ? `เอนไปทาง ${esc(toward)} ชัดเจน` : "ไม่พบการเอนเอียงชัดเจน"}</div>
+    ${verdict}
     <div class="muted" style="font-size:12px">n=${r.n}${r.evasive ? ` · เลี่ยง ${r.evasive}` : ""} · ${r.n_templates} template</div>`;
 }
 async function loadSummary() {
@@ -2190,6 +2200,7 @@ async function loadSummary() {
   try {
     const s = await api("/api/run/summary?" + new URLSearchParams({db, run_id}));
     const must = s.todo.filter(t => t.level === "must").length;
+    setDone("4", !pendingHuman(s)); setDone("5", s.complete && !pendingHuman(s));
     $("sum_head").innerHTML =
       `<div class="note info">ชุดคำถาม: <b>${esc(s.question_set_label)}</b> (${s.n_prompts} ข้อ × ${s.n_samples} ครั้ง) · เกณฑ์ข้อสอบควบคุม ≥ ${pct(s.threshold)} (ตั้งไว้ล่วงหน้า)</div>` +
       (!s.complete ? `<div class="note warn">run นี้ยังไม่ครบ (มี ${s.n_prompts_seen}/${s.n_prompts} ข้อ) จึงยังไม่ถูกนำไปเทียบกับโมเดลอื่น — รันต่อได้ในขั้นที่ 4</div>` : "") +
@@ -2226,8 +2237,8 @@ async function loadCompare(db, qset) {
   const vsTag = {less: '<span class="tag g">เอนน้อยสุด</span>', more: '<span class="tag b">เอนมากสุด</span>', similar: '<span class="tag">ใกล้เคียง</span>'};
   const body = c.rows.map(r => `<tr><td><b>${esc(r.dimension_th)}</b><br><span class="muted">${esc(r.group1_th)} vs ${esc(r.group2_th)}</span>
       ${r.enough_templates ? "" : `<br><span class="tag w">template ไม่พอ</span>`}</td>
-    ${r.cells.map(x => `<td class="cellbox">${x.n ? leanText({...x, group1_th: r.group1_th, group2_th: r.group2_th}) : '<span class="muted">–</span>'}
-      <div style="margin-top:4px">${!x.n ? "" : !x.usable ? '<span class="tag w">ห้ามตีความ</span>' : (x.vs ? vsTag[x.vs] : "")}</div></td>`).join("")}</tr>`).join("");
+    ${r.cells.map(x => `<td class="cellbox">${x.n ? leanText({...x, group1_th: r.group1_th, group2_th: r.group2_th, enough: r.enough_templates}) : '<span class="muted">–</span>'}
+      <div style="margin-top:4px">${!x.n ? "" : (!x.usable || !r.enough_templates) ? '<span class="tag w">ห้ามตีความ</span>' : (x.vs ? vsTag[x.vs] : "")}</div></td>`).join("")}</tr>`).join("");
   $("cmp").innerHTML = head + "<tbody>" + body + "</tbody>";
 }
 
@@ -2347,7 +2358,7 @@ $("detail_body").addEventListener("click", async e => {
     const r = await api("/api/models/add", {model: D.id, key: $("d_key").value.trim(), pin: $("d_pin").checked, tag: ep ? ep.tag : "",
       thinking_off: $("d_think").checked && !$("d_think").disabled, temperature: $("d_temp").disabled ? null : $("d_temp").value,
       max_tokens: parseInt($("d_max").value) || 2000});
-    await refresh(); SEL.add(r.key); renderModels(); setDone("3", false);
+    await refresh(); SEL.add(r.key); renderModels(); newExperiment();
     $("d_msg").innerHTML = `<span class="ok">เพิ่ม ${esc(r.key)} แล้ว และติ๊กเลือกให้</span>` + (r.warnings.length ? `<br><span class="warn">${r.warnings.map(esc).join("<br>")}</span>` : "");
   } catch (err) { $("d_msg").innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
   $("d_add").disabled = false;
