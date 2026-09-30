@@ -24,31 +24,6 @@
 default_models: []
 
 models:
-  # Same family as the earlier local qwen3.5:4b, the smallest Qwen3.5 on OpenRouter.
-  # Thinking OFF, as in the local runs (empty-answer problem with thinking on).
-  # Provider moved DeepInfra -> Parasail on 2026-09-30 (DeepInfra kept answering HTTP 429
-  # "rate-limited upstream"); same bf16 precision. Do not pool with DeepInfra-served runs.
-  - key: or-qwen35-9b
-    provider: openai_compatible
-    model: qwen/qwen3.5-9b
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-    rpm: 60
-    concurrency: 2
-    temperature: 0.7       # >0 so seeds give distinct samples; same value for every model
-    max_tokens: 2000
-    timeout_s: 120
-    seed_base: 1000        # sample i -> seed 1000 + i
-    extra_body:
-      reasoning:
-        enabled: false
-      provider:
-        order: ["parasail"]
-        quantizations: ["bf16"]
-        allow_fallbacks: false
-        require_parameters: true
-    note: "OpenRouter qwen/qwen3.5-9b pinned to Parasail bf16; $0.10/M in, $0.25/M out (checked 2026-09-30); thinking OFF"
-
   # A second, non-Qwen open-weights model for contrast.
   - key: or-gemma4-31b
     provider: openai_compatible
@@ -70,3 +45,67 @@ models:
         allow_fallbacks: false
         require_parameters: true
     note: "OpenRouter google/gemma-4-31b-it pinned to Novita bf16; $0.14/M in, $0.40/M out (checked 2026-09-24); thinking OFF"
+
+  # >>> webui-added or-deepseek-v41-flash (2026-09-30)
+  - key: "or-deepseek-v41-flash"
+    provider: openai_compatible
+    model: "deepseek/deepseek-v4.1-flash"
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 60
+    concurrency: 2
+    temperature: 0.7
+    max_tokens: 2000
+    timeout_s: 180
+    seed_base: 1000
+    extra_body: {"reasoning": {"enabled": false}, "provider": {"order": ["novita"], "allow_fallbacks": false, "require_parameters": true, "quantizations": ["fp8"]}}
+    note: "OpenRouter deepseek/deepseek-v4.1-flash pinned to Novita fp8; $0.3/M in, $1.2/M out (checked 2026-09-30); thinking OFF"
+  # <<< webui-added or-deepseek-v41-flash
+
+  # >>> webui-added or-qwen38-flash (2026-09-30)
+  - key: "or-qwen38-flash"
+    provider: openai_compatible
+    model: "qwen/qwen3.8-flash"
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 60
+    concurrency: 2
+    temperature: 0.7
+    max_tokens: 2000
+    timeout_s: 180
+    seed_base: 1000
+    extra_body: {"reasoning": {"enabled": false}, "provider": {"order": ["alibaba"], "allow_fallbacks": false, "require_parameters": true}}
+    note: "OpenRouter qwen/qwen3.8-flash pinned to Alibaba quantization unknown; $0.15/M in, $0.47/M out (checked 2026-09-30); thinking OFF"
+  # <<< webui-added or-qwen38-flash
+
+  # >>> webui-added or-llama-4-scout (2026-09-30)
+  - key: "or-llama-4-scout"
+    provider: openai_compatible
+    model: "meta-llama/llama-4-scout"
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 60
+    concurrency: 2
+    temperature: 0.7
+    max_tokens: 2000
+    timeout_s: 180
+    seed_base: 1000
+    extra_body: {"provider": {"order": ["novita"], "allow_fallbacks": false, "require_parameters": true, "quantizations": ["bf16"]}}
+    note: "OpenRouter meta-llama/llama-4-scout pinned to Novita bf16; $0.18/M in, $0.59/M out (checked 2026-09-30); thinking default (not disabled)"
+  # <<< webui-added or-llama-4-scout
+
+  # >>> webui-added or-hy3 (2026-09-30)
+  - key: "or-hy3"
+    provider: openai_compatible
+    model: "tencent/hy3"
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 60
+    concurrency: 2
+    temperature: 0.7
+    max_tokens: 2000
+    timeout_s: 180
+    seed_base: 1000
+    extra_body: {"reasoning": {"enabled": false}, "provider": {"order": ["novita"], "allow_fallbacks": false, "require_parameters": true}}
+    note: "OpenRouter tencent/hy3 pinned to Novita quantization unknown; $0.14/M in, $0.58/M out (checked 2026-09-30); thinking OFF"
+  # <<< webui-added or-hy3
