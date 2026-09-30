@@ -1507,6 +1507,7 @@ pre.log:empty { display: none; }
 
 /* tables */
 .scroll { overflow-x: auto; }
+.scroll:not(.catlist) > table { min-width: 560px; }   /* phones: scroll sideways instead of squeezing columns */
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 600; font-size: 12px; background: var(--bg); }
@@ -1786,6 +1787,7 @@ function go(step) {
   if (STEP === "5") { fillRunSelect("r5"); loadSummary(); }
   if (STEP === "adv") renderAdvanced();
   window.scrollTo({top: 0, behavior: "smooth"});
+  history.replaceState(null, "", "#" + STEP);   // reload stays on this step
 }
 function markDone() {
   const done = {"1": !!(SEL && SEL.size > 0), "2": !!QSET, "3": !!CUR};
@@ -1993,6 +1995,10 @@ function fillRunSelect(id) {
   el.innerHTML = S.runs.length ? S.runs.map(r => `<option value="${r.db}|${esc(r.run_id)}">${esc(r.run_id)}${r.db === "dry" ? " (dry run)" : ""} · ${esc((r.created_at || "").slice(0, 16).replace("T", " "))}</option>`).join("")
     : `<option value="">ยังไม่มี run</option>`;
   if (CUR && S.runs.some(r => r.db + "|" + r.run_id === CUR)) el.value = CUR;
+  else if (S.runs.length) {   // nothing picked yet: the most recent run
+    const r = S.runs.reduce((a, b) => (b.created_at || "") > (a.created_at || "") ? b : a);
+    el.value = r.db + "|" + r.run_id;
+  }
 }
 $("r4").addEventListener("change", () => { CUR = $("r4").value; store.set("bias_last_run", CUR); loadReview(); });
 $("r5").addEventListener("change", () => { CUR = $("r5").value; store.set("bias_last_run", CUR); loadSummary(); });
@@ -2319,9 +2325,11 @@ $("detail_body").addEventListener("click", async e => {
 });
 
 /* ----------------------------- boot ----------------------------- */
+const hashStep = () => ["1", "2", "3", "4", "5", "adv"].find(k => k === location.hash.slice(1));
+window.addEventListener("hashchange", () => { const k = hashStep(); if (k && k !== STEP) go(k); });   // Back button, edited URL
 $("steps").addEventListener("click", e => { const b = e.target.closest("button[data-step]"); if (b) go(b.dataset.step); });
 renderToggles();
-refresh().then(() => { go(1); if (S.job.running || S.job.argv.length) startPolling(); });
+refresh().then(() => { go(hashStep() || 1); if (S.job.running || S.job.argv.length) startPolling(); });
 </script>
 </body>
 </html>
