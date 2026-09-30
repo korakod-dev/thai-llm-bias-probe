@@ -746,6 +746,30 @@ def _open_label_db(kind: str) -> sqlite3.Connection:
     return db
 
 
+def _reuse_labels(kind: str, run_id: str) -> None:
+    """Copy earlier human labels onto identical question+answer items of this run
+    (spike.reuse_labels). Best effort: a busy or missing database just means no copy now."""
+    try:
+        db = _open_label_db(kind)
+    except BadRequest:
+        return
+    try:
+        spike.reuse_labels(db, run_id)
+    except sqlite3.Error:
+        pass
+    finally:
+        db.close()
+
+
+def _reused_keys(db: sqlite3.Connection, run_id: str, field: str) -> set:
+    """Items of the run whose current label for `field` was copied, not given by a person."""
+    return {(p, m, i) for p, m, i in db.execute(
+        "SELECT l.prompt_id, l.model_key, l.sample_idx FROM labels l "
+        "JOIN (SELECT MAX(id) AS id FROM labels WHERE run_id=? AND field=? "
+        "      GROUP BY prompt_id, model_key, sample_idx) last ON l.id = last.id "
+        "WHERE l.source='reuse' AND l.value IS NOT NULL", (run_id, field))}
+
+
 def _blind_order(run_id: str, gen_id: int) -> str:
     """Fixed pseudo-random order per run, so both models' answers are interleaved (blind mode)
     and the order is the same every time the page is opened."""
@@ -760,7 +784,12 @@ def label_items(kind: str, run_id: str, task: str) -> dict:
         raise BadRequest("ไม่รู้จักงานติดป้ายนี้")
     db = _open_label_db(kind)
     try:
+        try:
+            spike.reuse_labels(db, run_id)
+        except sqlite3.Error:
+            pass
         current = spike.current_labels(db, run_id)
+        reused = _reused_keys(db, run_id, field)
         counts = {(p, m, i): n for p, m, i, n in db.execute(
             "SELECT prompt_id, model_key, sample_idx, COUNT(*) FROM labels WHERE run_id=? "
             "GROUP BY prompt_id, model_key, sample_idx", (run_id,))}
@@ -783,6 +812,7 @@ def label_items(kind: str, run_id: str, task: str) -> dict:
             "question": prompt.get("text", ""), "expected": prompt.get("expected_answer"),
             "response": text or "", "hint": analysed.get("control_auto_correct"),
             "label": lab.get(field), "note": lab.get("human_notes", ""),
+            "reused": (prompt_id, model_key, idx) in reused,
             "n_history": counts.get((prompt_id, model_key, idx), 0),
             "_order": _blind_order(run_id, gid),
         })
@@ -845,7 +875,7 @@ def get_history(kind: str, run_id: str, gen_id: str) -> list:
 # Known question sets, shown as cards in step 2 (other *.jsonl files are listed as "อื่นๆ").
 QUESTION_SETS = {
     "prompts_v3_ping.jsonl": ("ชุดตรวจการเชื่อมต่อ", "เช็คว่าโมเดลและผู้ให้บริการตอบได้ก่อนรันชุดที่ยาวกว่า: ข้อสอบควบคุม "
-                              "2 ข้อ + 1 มิติ (1 template) สรุปผลจริงไม่ได้"),
+                              "2 ข้อ (ตรวจอัตโนมัติ ไม่ต้องติดป้าย) + 1 มิติ (1 template) สรุปผลจริงไม่ได้"),
     "prompts_v3_mini.jsonl": ("ชุดทดลอง", "ดูภาพรวมทุกขั้นตอนแบบเร็ว: ข้อสอบควบคุม 6 ข้อ + มิติละ 1 template "
                               "(7 มิติ) ใช้ทำความเข้าใจการทำงาน สรุปผลจริงไม่ได้"),
     "controls_only.jsonl": ("ข้อสอบควบคุม", "22 ข้อง่ายๆ ที่มีเฉลย เช็คว่าโมเดลเข้าใจภาษาไทยและทำตามคำสั่งได้ "
@@ -912,6 +942,7 @@ def run_summary(kind: str, run_id: str) -> dict:
     th = _thresholds()
     threshold = float(th["control_pass_threshold"])
     min_t = int(th.get("min_independent_templates_per_dimension", 3))
+    _reuse_labels(kind, run_id)
     db = _open_read(kind)
     try:
         meta = db.execute("SELECT created_at, n_samples, prompts_file FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -921,6 +952,7 @@ def run_summary(kind: str, run_id: str) -> dict:
         stats = spike.compute_score(db, run_id, spike.human_control_map(db, run_id))
         dims = spike.bias_by_dimension(db, run_id)
         labels = spike.current_labels(db, run_id)
+        n_reused = len(_reused_keys(db, run_id, "human_control_correct"))
         per_model_rows = db.execute(
             "SELECT model_key, model_id, status, prompt_id, sample_idx, prompt_json, response_text, "
             "json_extract(raw_json, '$.usage.cost') FROM generations WHERE run_id=?", (run_id,)).fetchall()
@@ -986,6 +1018,10 @@ def run_summary(kind: str, run_id: str) -> dict:
         todo.append({"level": "info", "model": None, "action": None,
                      "text": f"มิติที่มี template น้อยกว่า {min_t} ({', '.join(few)}) — ใช้ดูภาพรวมได้ แต่ยังสรุปเรื่องอคติไม่ได้ "
                              f"ตามเกณฑ์ที่ตั้งไว้ล่วงหน้า ต้องรันชุดเต็ม"})
+    if n_reused:
+        todo.append({"level": "info", "model": None, "action": None,
+                     "text": f"ใช้ป้ายเดิม {n_reused} ข้อ — คำถาม เฉลย และคำตอบตรงกับที่เคยติดป้ายไว้แล้วทุกตัวอักษร "
+                             f"จึงไม่ถามซ้ำ ตรวจหรือแก้ได้ด้านล่างโดยเลือกดูทุกข้อ"})
     if not any(t["level"] == "must" for t in todo):
         todo.insert(0, {"level": "done", "model": None, "action": None,
                         "text": "ไม่มีงานที่ต้องให้คนยืนยันค้างอยู่ — ดูผลในขั้นที่ 5 ได้เลย"})
@@ -2095,7 +2131,8 @@ const lDone = () => L ? L.items.filter(x => x.label).length : 0;
 function lprog() {
   const n = L ? L.items.length : 0, k = lDone();
   $("l_bar").style.width = n ? (100 * k / n) + "%" : "0";
-  $("l_info").textContent = n ? `ติดป้ายแล้ว ${k}/${n} ข้อ${k === n ? " — ครบแล้ว ✓" : ""} · คีย์ลัด Y = ถูก, N = ผิด, ← → = เลื่อน` : "";
+  const ru = L ? L.items.filter(x => x.reused && x.label).length : 0;
+  $("l_info").textContent = n ? `ติดป้ายแล้ว ${k}/${n} ข้อ${ru ? ` (ใช้ป้ายเดิม ${ru} ข้อ)` : ""}${k === n ? " — ครบแล้ว ✓" : ""} · คีย์ลัด Y = ถูก, N = ผิด, ← → = เลื่อน` : "";
 }
 function gotoNext(from) {
   const n = L.items.length;
@@ -2116,7 +2153,8 @@ function renderLabel() {
   $("l_q").textContent = it.question; $("l_exp").textContent = it.expected ?? "(ไม่มีเฉลย)";
   $("l_resp").textContent = it.response; $("l_resp").scrollTop = 0;
   $("l_cur").className = "pill " + (it.label === "y" ? "ok" : it.label === "n" ? "bad" : "muted");
-  $("l_cur").textContent = it.label === "y" ? "ป้ายตอนนี้: ถูก" : it.label === "n" ? "ป้ายตอนนี้: ผิด" : "ยังไม่ติดป้าย";
+  $("l_cur").textContent = (it.label === "y" ? "ป้ายตอนนี้: ถูก" : it.label === "n" ? "ป้ายตอนนี้: ผิด" : "ยังไม่ติดป้าย")
+    + (it.label && it.reused ? " (ใช้ป้ายเดิม)" : "");
   $("l_clear").hidden = !it.label; $("l_note").value = it.note || "";
   $("l_hist").hidden = true; $("l_hist_btn").textContent = `ประวัติป้าย (${it.n_history})`;
   $("l_prev").disabled = L.i === 0; $("l_msg").textContent = "";
@@ -2134,7 +2172,12 @@ async function saveLabel(value) {
     await saveNote();
     const r = await api("/api/label/set", {db: L.db, run_id: L.run_id, gen_id: it.gen_id, field: L.field, value});
     if (value) sfx(value === "y" ? "ok" : "bad");   // only once it is saved
-    it.label = r.value; it.n_history = r.n_history;
+    it.label = r.value; it.n_history = r.n_history; it.reused = false;
+    if (value) {   // identical question+answer items still unlabelled get this label too (server-side reuse)
+      const fresh = await api("/api/label/items?" + new URLSearchParams({db: L.db, run_id: L.run_id, task: "control"})).catch(() => null);
+      const by = new Map(((fresh || {}).items || []).map(x => [x.gen_id, x]));
+      for (const x of L.items) { const y = by.get(x.gen_id); if (y && !x.label && y.label) { x.label = y.label; x.reused = y.reused; x.n_history = y.n_history; } }
+    }
     if (value !== null && gotoNext(L.i) === false) L.i = L.items.indexOf(it);
     renderLabel();
     if (lDone() === L.items.length) loadReviewTodoOnly();

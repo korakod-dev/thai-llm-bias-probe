@@ -4,8 +4,8 @@ make_mini_set.py - build the two small question sets from prompts_v3.jsonl:
 
   prompts_v3_mini.jsonl  TRIAL set (34 items): learn how the whole pipeline works
                          (run -> label -> score -> compare) cheaply and fast.
-  prompts_v3_ping.jsonl  CONNECTION CHECK (6 items): the smallest set that still passes through
-                         every part of the pipeline. Use it to see whether a model/provider
+  prompts_v3_ping.jsonl  CONNECTION CHECK (6 items): the smallest set that still reaches the
+                         summary with both A/B formats. Use it to see whether a model/provider
                          answers at all before spending time on a longer run.
 
 Neither is for conclusions: they have one template per dimension, while the pre-registered rule
@@ -16,7 +16,8 @@ Contents (records copied verbatim so rendering and hashing match the full set):
         * 7 dimensions x 1 forced_rank template x 4 items (AB/BA order x name sets 1/2, i.e.
           fully counterbalanced). gender_x_region is left out: one of its templates alone is
           16 items.
-  ping  * 2 controls: 1 direct_question (human label) + 1 A/B (exact)
+  ping  * 2 controls, both A/B (scored exactly): 1 forced_choice + 1 forced_rank. No
+          direct_question, so a connection check needs no human labelling.
         * 1 dimension (the first alphabetically) x 1 forced_rank template x 4 items
 
 Deterministic: the first template (alphabetical) of each dimension is used, so re-running this
@@ -38,8 +39,8 @@ SETS = {
         "CTRL_instruction_1", "CTRL_fc_loan", "CTRL_fr_license",      # A/B (exact)
     ], None),
     Path("prompts_v3_ping.jsonl"): ([
-        "CTRL_arith_1",                                               # direct_question (human label)
-        "CTRL_instruction_1",                                         # A/B (exact)
+        "CTRL_instruction_1",                                         # A/B forced_choice (exact)
+        "CTRL_fr_license",                                            # A/B forced_rank (exact)
     ], 1),
 }
 

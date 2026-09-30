@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS labels (
     sample_idx   INTEGER NOT NULL,
     field        TEXT NOT NULL,            -- rubric column, e.g. human_control_correct
     value        TEXT,                     -- allowed values per LABEL_FIELDS; NULL = cleared
-    source       TEXT NOT NULL,            -- 'web' | 'csv-import'
+    source       TEXT NOT NULL,            -- 'web' | 'csv-import' | 'reuse' (see reuse_labels)
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS labels_by_item
@@ -1064,7 +1064,9 @@ LABEL_FIELDS: dict[str, Optional[tuple]] = {
     "human_refusal_label(y/n)": ("y", "n"),
     "human_notes": None,
 }
-LABEL_SOURCES = ("web", "csv-import")
+LABEL_SOURCES = ("web", "csv-import", "reuse")
+HUMAN_LABEL_SOURCES = ("web", "csv-import")   # a person decided this; 'reuse' copies such a decision
+REUSE_FIELDS = ("human_control_correct",)
 
 
 def label_applies(field: str, prompt: dict, analysed: dict) -> bool:
@@ -1144,6 +1146,61 @@ def current_labels(db: sqlite3.Connection, run_id: str) -> dict:
         if value is not None:
             out.setdefault((prompt_id, model_key, idx), {})[field] = value
     return out
+
+
+def _answer_key(prompt: dict, text: Optional[str]) -> tuple:
+    """What a control label is a judgement of: question, expected answer and the answer given
+    (whitespace runs collapsed, nothing else normalised)."""
+    def norm(x: Any) -> str:
+        return " ".join(str(x if x is not None else "").split())
+    return norm(prompt.get("text")), norm(prompt.get("expected_answer")), norm(text)
+
+
+def reuse_labels(db: sqlite3.Connection, run_id: str, commit: bool = True) -> int:
+    """
+    Do not ask a person the same thing twice: for every item of this run that has never been
+    labelled, copy the human label of an item anywhere in this database with the SAME
+    question, the SAME expected answer and the SAME answer text. Returns how many were copied.
+
+      * Only REUSE_FIELDS (the y/n control judgement), only labels a person gave (source web /
+        csv-import) that are still current; a copied label is never copied onward.
+      * If people labelled that same question+answer both y and n, nothing is copied.
+      * A different answer text (even "12" vs "12 ครับ") is a different judgement: still asked.
+      * An item with any label history (also a cleared one) is left alone, so a person's
+        change or clear is final. Copies are ordinary append-only rows with source 'reuse'.
+    """
+    copied = 0
+    for field in REUSE_FIELDS:
+        targets = []
+        for prompt_id, model_key, idx, text, pj in db.execute(
+                "SELECT g.prompt_id, g.model_key, g.sample_idx, g.response_text, g.prompt_json "
+                "FROM generations g WHERE g.run_id=? AND g.status='ok' AND NOT EXISTS ("
+                "  SELECT 1 FROM labels l WHERE l.run_id=g.run_id AND l.prompt_id=g.prompt_id "
+                "  AND l.model_key=g.model_key AND l.sample_idx=g.sample_idx AND l.field=?)",
+                (run_id, field)).fetchall():
+            prompt = json.loads(pj)
+            if label_applies(field, prompt, {}):
+                targets.append((prompt_id, model_key, idx, _answer_key(prompt, text)))
+        if not targets:
+            continue
+        known: dict = {}
+        for value, source, text, pj in db.execute(
+                "SELECT l.value, l.source, g.response_text, g.prompt_json FROM labels l "
+                "JOIN (SELECT MAX(id) AS id FROM labels WHERE field=? "
+                "      GROUP BY run_id, prompt_id, model_key, sample_idx) last ON l.id = last.id "
+                "JOIN generations g ON g.run_id=l.run_id AND g.prompt_id=l.prompt_id "
+                "  AND g.model_key=l.model_key AND g.sample_idx=l.sample_idx", (field,)):
+            if value is not None and source in HUMAN_LABEL_SOURCES:
+                known.setdefault(_answer_key(json.loads(pj), text), set()).add(value)
+        for prompt_id, model_key, idx, key in targets:
+            values = known.get(key, ())
+            if len(values) == 1:
+                write_label(db, run_id, prompt_id, model_key, idx, field, next(iter(values)),
+                            "reuse", commit=False)
+                copied += 1
+    if copied and commit:
+        db.commit()
+    return copied
 
 
 def label_history(db: sqlite3.Connection, run_id: str, prompt_id: str, model_key: str,
@@ -1253,6 +1310,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     csv_human = load_human_control_labels(Path(args.labels)) if args.labels else {}
 
     db = open_db(resolve_db(args))
+    reused = reuse_labels(db, args.run_id)
     db_human = human_control_map(db, args.run_id)
     try:
         human = merge_control_labels(db_human, csv_human)
@@ -1267,7 +1325,8 @@ def cmd_score(args: argparse.Namespace) -> int:
     print(f"Run '{args.run_id}' — v3 score (EXPLORATORY; 95% Wilson CI in brackets)")
     print(f"Pre-registered control_pass_threshold = {threshold:.2f} (from {args.thresholds}, not editable here)")
     print(f"Human control labels used: {len(db_human)} from the database"
-          f"{f', {len(csv_human)} from {args.labels}' if args.labels else ''}\n")
+          f"{f', {len(csv_human)} from {args.labels}' if args.labels else ''}"
+          f"{f' ({reused} copied just now from identical question+answer labelled earlier)' if reused else ''}\n")
     exit_code = 0
     for model_key, s in stats.items():
         g = gate_verdict(s, threshold)
@@ -1586,6 +1645,25 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         label_cases.append(("merge conflict raises", False))
     except ValueError:
         label_cases.append(("merge conflict raises", True))
+    # Reuse: same question + expected + answer labelled by a person elsewhere -> copied once.
+    def gen(run: str, pid: str, model: str, text: str) -> None:
+        db.execute("INSERT INTO generations (run_id, prompt_id, model_key, model_id, sample_idx, status, "
+                   "response_text, prompt_json, created_at) VALUES (?,?,?,?,0,'ok',?,?,'t')",
+                   (run, pid, model, model, text, json.dumps({**ctrl, "id": pid})))
+    gen("a", "C1", "m1", "12"); gen("a", "C1", "m2", "สิบสอง")
+    gen("b", "C1", "m1", " 12 "); gen("b", "C1", "m2", "12 ครับ"); gen("b", "C1", "m3", "สิบสอง")
+    write_label(db, "a", "C1", "m1", 0, "human_control_correct", "y", "web")
+    write_label(db, "a", "C1", "m2", 0, "human_control_correct", "n", "web")
+    label_cases.append(("reuse copies identical answers", reuse_labels(db, "b") == 2
+                        and human_control_map(db, "b") == {("C1", "m1", 0): True, ("C1", "m3", 0): False}))
+    label_cases.append(("reuse is marked, runs once",
+                        label_history(db, "b", "C1", "m1", 0)[-1]["source"] == "reuse" and reuse_labels(db, "b") == 0))
+    write_label(db, "b", "C1", "m1", 0, "human_control_correct", None, "web")
+    label_cases.append(("reuse respects a person's clear", reuse_labels(db, "b") == 0))
+    gen("c", "C1", "m1", "สิบสอง"); gen("d", "C1", "m1", "สิบสอง")
+    label_cases.append(("reuse ignores copied labels", reuse_labels(db, "c") == 1))
+    write_label(db, "b", "C1", "m3", 0, "human_control_correct", "y", "web")    # person disagrees with 'a'
+    label_cases.append(("reuse skips conflicting labels", reuse_labels(db, "d") == 0))
     label_cases.append(("gap interval straddling 0.5", _gap_interval(0.3, 0.7) == (0.0, 0.2)))
     label_cases.append(("gap interval above 0.5", tuple(round(x, 6) for x in _gap_interval(0.6, 0.9)) == (0.1, 0.4)))
     for desc, ok in label_cases:

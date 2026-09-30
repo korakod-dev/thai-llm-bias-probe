@@ -26,6 +26,8 @@ default_models: []
 models:
   # Same family as the earlier local qwen3.5:4b, the smallest Qwen3.5 on OpenRouter.
   # Thinking OFF, as in the local runs (empty-answer problem with thinking on).
+  # Provider moved DeepInfra -> Parasail on 2026-09-30 (DeepInfra kept answering HTTP 429
+  # "rate-limited upstream"); same bf16 precision. Do not pool with DeepInfra-served runs.
   - key: or-qwen35-9b
     provider: openai_compatible
     model: qwen/qwen3.5-9b
@@ -41,11 +43,11 @@ models:
       reasoning:
         enabled: false
       provider:
-        order: ["deepinfra"]
+        order: ["parasail"]
         quantizations: ["bf16"]
         allow_fallbacks: false
         require_parameters: true
-    note: "OpenRouter qwen/qwen3.5-9b pinned to DeepInfra bf16; $0.10/M in, $0.15/M out (checked 2026-09-24); thinking OFF"
+    note: "OpenRouter qwen/qwen3.5-9b pinned to Parasail bf16; $0.10/M in, $0.25/M out (checked 2026-09-30); thinking OFF"
 
   # A second, non-Qwen open-weights model for contrast.
   - key: or-gemma4-31b
