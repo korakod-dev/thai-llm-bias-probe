@@ -77,7 +77,7 @@ DEFAULT_CONFIG = ROOT / "config" / "models.yaml"
 CONFIG = DEFAULT_CONFIG                         # overridden by --config in main()
 CONFIG_LOCK = threading.Lock()
 DBS = {"real": ROOT / "bias_poc.db", "dry": ROOT / "bias_poc_dry.db"}
-STATIC = ROOT / "static"                         # 3D scene, sound effects, vendored three.js
+STATIC = ROOT / "static"                         # sound effects
 STATIC_TYPES = {".js": "text/javascript; charset=utf-8", ".txt": "text/plain; charset=utf-8"}
 TOKEN = secrets.token_urlsafe(24)               # new on every start; embedded in the page only
 
@@ -1253,11 +1253,7 @@ class Handler(BaseHTTPRequestHandler):
             f = (STATIC / url.path[len("/static/"):]).resolve()
             if STATIC not in f.parents or not f.is_file() or f.suffix not in STATIC_TYPES:
                 return self._send(404, b"not found", "text/plain")
-            # static/vendor/<name>-<version>/ never changes (an upgrade gets a new folder and a
-            # new URL), so the browser may keep it; our own scripts are always re-read.
-            vendored = STATIC / "vendor" in f.parents
-            return self._send(200, f.read_bytes(), STATIC_TYPES[f.suffix],
-                              cache="max-age=31536000, immutable" if vendored else "no-store")
+            return self._send(200, f.read_bytes(), STATIC_TYPES[f.suffix], cache="no-store")
         if url.path == "/api/state":
             return self._json(state())
         if url.path == "/api/job":
@@ -1342,7 +1338,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ----------------------------------------------------------------------------------------
-# Page (no external resources; the optional 3D scene and sounds are served from static/)
+# Page (no external resources; the sound effects are served from static/)
 # ----------------------------------------------------------------------------------------
 PAGE = r"""<!doctype html>
 <html lang="th">
@@ -1350,257 +1346,233 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bias POC Runner</title>
-<script>
-// 3D view unless: no WebGL2, the OS asks for reduced motion (and 3D was not picked by hand),
-// or 2D was picked with the toggle. Decided before first paint so the layout does not jump.
-(() => {
-  let pref = null; try { pref = localStorage.getItem("bias_view"); } catch (e) {}
-  let gl = false;
-  try {
-    const x = document.createElement("canvas").getContext("webgl2"); gl = !!x;
-    const lose = x && x.getExtension("WEBGL_lose_context"); if (lose) lose.loseContext();
-  } catch (e) {}
-  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  document.documentElement.dataset.gl = gl ? "1" : "";
-  if (gl && pref !== "2d" && (!reduce || pref === "3d")) document.documentElement.classList.add("three");
-})();
-</script>
-<script type="importmap">{"imports": {"three": "/static/vendor/three-0.186.1/build/three.module.js", "three/addons/": "/static/vendor/three-0.186.1/addons/"}}</script>
 <script src="/static/sfx.js"></script>
 <style>
 :root {
-  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
-  --accent: #2f5d8a; --accent-ink: #ffffff; --accent-soft: #e6eef6;
-  --ok: #2e7d4f; --ok-soft: #e5f2ea; --warn: #a15c00; --warn-soft: #fbf0df; --bad: #b3261e; --bad-soft: #f9e4e2;
-  --code-bg: #1e1f22; --code-ink: #e6e6e3; --hover: #f0eee8;
+  --bg: #f5f6f8; --panel: #ffffff; --side: #ffffff; --ink: #111827; --ink2: #374151; --muted: #6b7280; --line: #e5e7eb;
+  --accent: #2563eb; --accent-ink: #ffffff; --accent-soft: #eff4ff; --accent-line: #bfd3fe;
+  --ok: #15803d; --ok-soft: #ecfdf3; --warn: #b45309; --warn-soft: #fffbeb; --bad: #b91c1c; --bad-soft: #fef2f2;
+  --code-bg: #0f172a; --code-ink: #e2e8f0; --hover: #f3f4f6;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .06);
+  --focus: 0 0 0 3px rgba(37, 99, 235, .25);
+  color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #161615; --panel: #1f1f1d; --ink: #ecebe7; --muted: #a09e98; --line: #34332f;
-    --accent: #7fb0e0; --accent-ink: #10202f; --accent-soft: #1d2a36;
-    --ok: #6cc28f; --ok-soft: #1a2b21; --warn: #e0a24a; --warn-soft: #2e2415; --bad: #f08a80; --bad-soft: #321c1a;
-    --code-bg: #0f0f0e; --code-ink: #dcdcd8; --hover: #2a2926;
+    --bg: #0b0d12; --panel: #13161d; --side: #10131a; --ink: #f3f4f6; --ink2: #d1d5db; --muted: #9ca3af; --line: #262b36;
+    --accent: #5b8def; --accent-ink: #ffffff; --accent-soft: #172036; --accent-line: #2c4474;
+    --ok: #4ade80; --ok-soft: #10231a; --warn: #fbbf24; --warn-soft: #261d0c; --bad: #f87171; --bad-soft: #2a1414;
+    --code-bg: #070a10; --code-ink: #d7dde8; --hover: #1a1e27;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+    --focus: 0 0 0 3px rgba(91, 141, 239, .35);
+    color-scheme: dark;
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--ink);
-  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Sukhumvit Set", "Thonburi", "Segoe UI", sans-serif; }
-main { max-width: 1040px; margin: 0 auto; padding: 20px 16px 80px; }
-h1 { font-size: 21px; margin: 0; }
-h2 { font-size: 18px; margin: 0 0 4px; }
-h3 { font-size: 15px; margin: 18px 0 8px; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink);
+  font: 14.5px/1.6 -apple-system, BlinkMacSystemFont, "Inter", "Sukhumvit Set", "Thonburi", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased; }
+h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+h2 { font-size: 20px; margin: 0 0 4px; font-weight: 650; letter-spacing: -.015em; }
+h3 { font-size: 14.5px; margin: 26px 0 8px; font-weight: 600; }
 p { margin: 6px 0; }
+a { color: var(--accent); }
 .sub { color: var(--muted); font-size: 13.5px; }
-.top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
-.chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; min-width: 0; }
-.stack > * + * { margin-top: 14px; }
-label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
-input[type=text], input[type=number], input[type=search], select, textarea {
-  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--bg); color: var(--ink); font: inherit; }
-textarea { resize: vertical; }
-button { padding: 8px 16px; border: 0; border-radius: 8px; font: inherit; cursor: pointer;
-  background: var(--accent); color: var(--accent-ink); }
-button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-button.big { padding: 12px 26px; font-size: 16px; font-weight: 600; }
-button.small { padding: 3px 10px; font-size: 13px; }
-button.danger { background: var(--bad); color: #fff; }
-button.okbtn { background: var(--ok); color: #fff; }
-button.badbtn { background: var(--bad); color: #fff; }
-button:disabled { opacity: .45; cursor: default; }
-.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
-.between { justify-content: space-between; }
-.pill { display: inline-block; font-size: 12.5px; padding: 1px 9px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
-.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
-.hint { font-size: 13px; color: var(--muted); margin-top: 8px; }
-.note { border-radius: 8px; padding: 10px 12px; font-size: 13.5px; margin-top: 12px; }
-.note.info { background: var(--accent-soft); }
-.note.warn { background: var(--warn-soft); color: var(--ink); }
-.note.bad { background: var(--bad-soft); color: var(--ink); }
-.note.ok { background: var(--ok-soft); color: var(--ink); }
 [hidden] { display: none !important; }
 
-/* stepper */
-.steps { display: flex; gap: 4px; margin: 0 0 16px; overflow-x: auto; padding-bottom: 2px; }
-.steps button { flex: 1 0 auto; display: flex; align-items: center; gap: 8px; background: var(--panel); color: var(--muted);
-  border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; text-align: left; font-size: 14px; }
-.steps button .n { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 99px;
-  border: 1.5px solid currentColor; font-size: 13px; font-weight: 600; flex: none; }
-.steps button.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
-.steps button.done .n { background: var(--ok); border-color: var(--ok); color: #fff; }
-.steps button.adv { flex: 0 0 auto; }
+/* app shell: sidebar + content */
+.app { display: grid; grid-template-columns: 256px minmax(0, 1fr); min-height: 100vh; }
+.side { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 18px;
+  background: var(--side); border-right: 1px solid var(--line); padding: 20px 14px; overflow-y: auto; }
+.brand { display: flex; gap: 10px; align-items: center; padding: 0 6px; }
+.brand .logo { width: 30px; height: 30px; border-radius: 8px; background: var(--accent); color: #fff;
+  display: grid; place-items: center; font-weight: 700; font-size: 14px; flex: none; }
+.brand .sub { font-size: 12px; line-height: 1.3; }
+.navlabel { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 0 8px; margin-bottom: -10px; }
+.steps { display: flex; flex-direction: column; gap: 2px; }
+.steps button { display: flex; align-items: center; gap: 10px; width: 100%; background: transparent; color: var(--ink2);
+  border: 0; border-radius: 8px; padding: 8px 10px; text-align: left; font-size: 14px; font-weight: 500; }
+.steps button:hover { background: var(--hover); }
+.steps button .n { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 99px;
+  border: 1.5px solid var(--line); color: var(--muted); font-size: 12px; font-weight: 600; flex: none; background: var(--panel); }
+.steps button.on { background: var(--accent-soft); color: var(--accent); }
+.steps button.on .n { border-color: var(--accent); background: var(--accent); color: #fff; }
+.steps button.done:not(.on) .n { border-color: var(--ok); background: var(--ok); color: #fff; font-size: 0; }
+.steps button.done:not(.on) .n::after { content: "✓"; font-size: 12px; }
+.steps .sep { height: 1px; background: var(--line); margin: 8px 6px; }
+.side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 6px 0; border-top: 1px solid var(--line); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.content { min-width: 0; }
+main { max-width: 980px; margin: 0 auto; padding: 32px 32px 80px; }
+@media (max-width: 860px) {
+  .app { grid-template-columns: 1fr; }
+  .side { position: static; height: auto; flex-direction: column; gap: 10px; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .navlabel { display: none; }
+  .steps { flex-direction: row; overflow-x: auto; }
+  .steps button { width: auto; flex: none; white-space: nowrap; }
+  .steps .sep { width: 1px; height: auto; margin: 4px; }
+  .side-foot { flex-direction: row; align-items: center; justify-content: space-between; margin: 0; padding: 0; border: 0; }
+  main { padding: 20px 16px 60px; }
+}
+
+/* surfaces */
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 28px; box-shadow: var(--shadow); min-width: 0; }
+@media (max-width: 600px) { .card { padding: 18px; } }
+.card > h2 + .sub, .card > h2 + p { margin-bottom: 4px; }
+.eyebrow { font-size: 12px; font-weight: 600; color: var(--accent); letter-spacing: .04em; text-transform: uppercase; margin-bottom: 4px; }
+.stack > * + * { margin-top: 14px; }
+
+/* form controls */
+label { display: block; font-size: 13px; font-weight: 500; color: var(--ink2); margin: 14px 0 6px; }
+input[type=text], input[type=number], input[type=search], select, textarea {
+  width: 100%; padding: 8px 11px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); color: var(--ink); font: inherit; font-size: 14px; transition: border-color .15s, box-shadow .15s; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus); }
+input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
+textarea { resize: vertical; }
+button { padding: 8px 16px; border: 1px solid transparent; border-radius: 8px; font: inherit; font-size: 14px; font-weight: 550;
+  cursor: pointer; background: var(--accent); color: var(--accent-ink); transition: filter .15s, background .15s; }
+button:hover:not(:disabled) { filter: brightness(1.07); }
+button:focus-visible { outline: none; box-shadow: var(--focus); }
+button.ghost { background: var(--panel); color: var(--ink); border-color: var(--line); box-shadow: var(--shadow); }
+button.ghost:hover:not(:disabled) { background: var(--hover); filter: none; }
+button.big { padding: 11px 24px; font-size: 15px; font-weight: 600; }
+button.small { padding: 3px 10px; font-size: 12.5px; }
+button.danger, button.badbtn { background: var(--bad); color: #fff; }
+button.okbtn { background: var(--ok); color: #fff; }
+button:disabled { opacity: .45; cursor: default; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 16px; }
+.between { justify-content: space-between; }
+.card > .row.between:last-child { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line); }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; padding: 2px 10px; border-radius: 99px;
+  background: var(--hover); white-space: nowrap; }
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: 99px; background: currentColor; }
+.pill.ok { background: var(--ok-soft); } .pill.warn { background: var(--warn-soft); } .pill.bad { background: var(--bad-soft); }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+.hint { font-size: 13px; color: var(--muted); margin-top: 8px; }
+.note { border-radius: 8px; padding: 11px 14px; font-size: 13.5px; margin-top: 14px; border: 1px solid transparent; }
+.note.info { background: var(--accent-soft); border-color: var(--accent-line); }
+.note.warn { background: var(--warn-soft); color: var(--ink); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+.note.bad { background: var(--bad-soft); color: var(--ink); border-color: color-mix(in srgb, var(--bad) 30%, transparent); }
+.note.ok { background: var(--ok-soft); color: var(--ink); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+details { margin-top: 18px; border: 1px solid var(--line); border-radius: 10px; padding: 0 14px; }
+details > summary { cursor: pointer; color: var(--ink2); font-size: 14px; font-weight: 500; padding: 11px 0; }
+details[open] { padding-bottom: 14px; }
 
 /* selectable cards */
-.choices { display: grid; gap: 10px; grid-template-columns: 1fr; margin-top: 12px; }
+.choices { display: grid; gap: 12px; grid-template-columns: 1fr; margin-top: 18px; }
 @media (min-width: 720px) { .choices.three { grid-template-columns: repeat(3, 1fr); } .choices.two { grid-template-columns: repeat(2, 1fr); } }
-.choice { position: relative; display: block; border: 1.5px solid var(--line); border-radius: 10px; padding: 12px 14px 12px 42px;
-  cursor: pointer; margin: 0; color: var(--ink); font-size: 14px; background: var(--panel); }
-.choice input { position: absolute; left: 14px; top: 15px; width: 17px; height: 17px; margin: 0; }
-.choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
-.choice .t { font-weight: 600; font-size: 15px; }
+.choice { position: relative; display: block; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px 14px 44px;
+  cursor: pointer; margin: 0; color: var(--ink); font-size: 14px; font-weight: 400; background: var(--panel); transition: border-color .15s, background .15s; }
+.choice:hover { border-color: var(--accent-line); }
+.choice input { position: absolute; left: 16px; top: 17px; width: 16px; height: 16px; margin: 0; }
+.choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent); }
+.choice .t { font-weight: 600; font-size: 14.5px; }
 .choice .d { color: var(--muted); font-size: 13px; margin-top: 3px; }
-.choice .meta { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
-.tag { display: inline-block; font-size: 12px; padding: 0 7px; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); }
-.tag.g { color: var(--ok); border-color: var(--ok); } .tag.w { color: var(--warn); border-color: var(--warn); } .tag.b { color: var(--bad); border-color: var(--bad); }
-details { margin-top: 14px; }
-details > summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+.choice .meta { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.tag { display: inline-block; font-size: 11.5px; font-weight: 500; padding: 1px 8px; border-radius: 6px; background: var(--hover); color: var(--muted); }
+.tag.g { color: var(--ok); background: var(--ok-soft); } .tag.w { color: var(--warn); background: var(--warn-soft); } .tag.b { color: var(--bad); background: var(--bad-soft); }
 
 /* run */
-.recap { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 14.5px; margin-top: 10px; }
+.recap { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; font-size: 14px; margin-top: 18px;
+  padding: 16px 18px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
 .recap div:nth-child(odd) { color: var(--muted); }
-.progress { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 14px; }
+.progress { height: 8px; background: var(--hover); border-radius: 99px; overflow: hidden; margin-top: 18px; }
 .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 .progress.done > div { background: var(--ok); }
-pre.log { background: var(--code-bg); color: var(--code-ink); margin: 8px 0 0; padding: 12px; border-radius: 8px;
-  max-height: 360px; overflow: auto; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+pre.log { background: var(--code-bg); color: var(--code-ink); margin: 8px 0 0; padding: 14px; border-radius: 8px;
+  max-height: 360px; overflow: auto; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
   white-space: pre-wrap; word-break: break-word; }
+pre.log:empty { display: none; }
 
 /* todo */
-.todo { list-style: none; padding: 0; margin: 10px 0 0; }
-.todo li { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+.todo { list-style: none; padding: 0; margin: 14px 0 0; }
+.todo li { display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; margin-top: 8px; }
 .todo li .ic { flex: none; width: 22px; text-align: center; font-weight: 700; }
 .todo li .tx { flex: 1; font-size: 14px; }
-.todo li.must { border-color: var(--bad); } .todo li.must .ic { color: var(--bad); }
+.todo li.must { border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); background: var(--bad-soft); } .todo li.must .ic { color: var(--bad); }
 .todo li.should .ic { color: var(--warn); } .todo li.info .ic { color: var(--muted); }
-.todo li.done { border-color: var(--ok); } .todo li.done .ic { color: var(--ok); }
+.todo li.done .ic { color: var(--ok); }
 
 /* label */
-.qa { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
-.qa.expected { border-color: var(--ok); }
-.qlabel { font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+.qa { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-top: 10px; }
+.qa.expected { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); background: var(--ok-soft); }
+.qlabel { font-size: 11.5px; font-weight: 600; letter-spacing: .03em; color: var(--muted); margin-bottom: 4px; }
 .qtext { white-space: pre-wrap; word-break: break-word; font-size: 14.5px; }
 .qtext.resp { max-height: 380px; overflow: auto; }
-.kbd { display: inline-block; font: 11px ui-monospace, Menlo, monospace; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; opacity: .8; }
-.lprog { height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 10px; }
+.kbd { display: inline-block; font: 11px ui-monospace, Menlo, monospace; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; opacity: .75; }
+.lprog { height: 6px; background: var(--hover); border-radius: 99px; overflow: hidden; margin-top: 12px; }
 .lprog div { height: 100%; width: 0; background: var(--ok); transition: width .2s; }
 
 /* tables */
 .scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-th, td { text-align: left; padding: 8px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
-td.num, th.num { text-align: right; white-space: nowrap; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; background: var(--bg); }
+td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .lean { display: flex; align-items: center; gap: 6px; min-width: 150px; }
-.bar { position: relative; flex: 1; height: 8px; background: var(--line); border-radius: 99px; min-width: 70px; }
+.bar { position: relative; flex: 1; height: 8px; background: var(--hover); border-radius: 99px; min-width: 70px; }
 .bar .mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--muted); }
-.bar .ci { position: absolute; top: 0; bottom: 0; background: var(--accent); opacity: .35; border-radius: 99px; }
+.bar .ci { position: absolute; top: 0; bottom: 0; background: var(--accent); opacity: .3; border-radius: 99px; }
 .bar .pt { position: absolute; top: -2px; width: 4px; height: 12px; margin-left: -2px; background: var(--accent); border-radius: 2px; }
 .cellbox { font-size: 13px; }
 .cellbox .l1 { white-space: nowrap; }
-.mcards { display: grid; gap: 12px; grid-template-columns: 1fr; margin-top: 10px; }
+.mcards { display: grid; gap: 12px; grid-template-columns: 1fr; margin-top: 14px; }
 @media (min-width: 760px) { .mcards { grid-template-columns: repeat(2, 1fr); } }
-.mcard { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; font-size: 13.5px; margin-top: 6px; }
+.mcard { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13.5px; margin-top: 8px; }
 .kv div:nth-child(odd) { color: var(--muted); }
-.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-top: 12px; }
 
 /* catalog (add model) */
-.catlist { max-height: 460px; overflow: auto; }
+#catalog { margin-top: 24px; padding-top: 4px; border-top: 1px solid var(--line); }
+.catlist { max-height: 460px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; margin-top: 8px; }
+.catlist th { position: sticky; top: 0; z-index: 1; }
 tr.pick { cursor: pointer; } tr.pick:hover { background: var(--hover); }
-tr.sel { background: var(--hover); outline: 2px solid var(--accent); outline-offset: -2px; }
-tr.grp td { background: var(--hover); font-weight: 600; font-size: 12.5px; padding: 5px 8px; position: sticky; top: 0; }
+tr.sel { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+tr.grp td { background: var(--bg); font-weight: 600; font-size: 12px; padding: 6px 10px; color: var(--muted); }
 .vchips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
-.vchips button { padding: 3px 10px; font-size: 12.5px; background: transparent; color: var(--ink); border: 1px solid var(--line); }
+.vchips button { padding: 3px 11px; font-size: 12.5px; font-weight: 500; background: var(--panel); color: var(--ink2); border: 1px solid var(--line); border-radius: 99px; }
 .vchips button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .mono { font: 12.5px ui-monospace, Menlo, monospace; word-break: break-all; }
-.grid2 { display: grid; gap: 14px; grid-template-columns: 1fr; }
-@media (min-width: 900px) { .grid2 { grid-template-columns: 1.2fr 1fr; } }
+.grid2 { display: grid; gap: 20px; grid-template-columns: 1fr; }
+@media (min-width: 1000px) { .grid2 { grid-template-columns: 1.2fr 1fr; } }
+#detail_body { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; align-self: start; }
+.choice [data-remove] { margin-left: auto; background: transparent; border: 0; box-shadow: none; color: var(--muted); font-weight: 500; }
+.choice [data-remove]:hover { color: var(--bad); background: var(--bad-soft); }
 .tool { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-html:not([data-gl="1"]) #view_toggle { display: none; }
-
-/* ----------------------------- 3D mode (html.three, see static/scene3d.js) ----------------------------- */
-#scene, #labels { display: none; }
-html:not(.three) [data-step="hub"], html:not(.three) [data-panel="hub"] { display: none !important; }
-html.three {
-  --bg: #04060c; --panel: rgba(13, 18, 31, .8); --ink: #e9edf5; --muted: #9aa5b8; --line: rgba(148, 170, 210, .2);
-  --accent: #7fb6ff; --accent-ink: #06121f; --accent-soft: rgba(127, 182, 255, .15);
-  --ok: #6cc28f; --ok-soft: rgba(108, 194, 143, .15); --warn: #f0b060; --warn-soft: rgba(240, 176, 96, .15);
-  --bad: #f08a80; --bad-soft: rgba(240, 138, 128, .15);
-  --code-bg: rgba(2, 4, 9, .85); --code-ink: #dfe6f2; --hover: rgba(127, 182, 255, .09);
-  color-scheme: dark;
-}
-html.three body { background: var(--bg); }
-html.three #scene { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 0; }
-html.three #labels { display: block; position: fixed; inset: 0; z-index: 1; pointer-events: none; overflow: hidden; }
-html.three main { position: relative; z-index: 2; max-width: none; padding: 18px 28px 80px; pointer-events: none; }
-html.three main > * { pointer-events: auto; }
-html.three .top { pointer-events: none; }
-html.three .top > * { pointer-events: auto; }
-html.three h1 { text-shadow: 0 0 26px rgba(127, 182, 255, .45); }
-html.three input[type=text], html.three input[type=number], html.three input[type=search], html.three select, html.three textarea {
-  background: rgba(3, 5, 10, .55); }
-html.three .card, html.three .steps button, html.three .choice {
-  background: var(--panel); border-color: var(--line);
-  -webkit-backdrop-filter: blur(18px) saturate(1.3); backdrop-filter: blur(18px) saturate(1.3); }
-html.three .choice:has(input:checked) { background: rgba(40, 72, 120, .5); border-color: var(--accent); }
-html.three .steps { pointer-events: none; }
-html.three .steps button { pointer-events: auto; }
-html.three .steps button.on { background: rgba(40, 72, 120, .6); box-shadow: 0 0 20px rgba(127, 182, 255, .25); }
-html.three .card[data-panel] { box-shadow: 0 24px 70px rgba(0, 0, 0, .5), inset 0 1px 0 rgba(255, 255, 255, .06);
-  animation: panelIn .6s cubic-bezier(.2, .8, .2, 1) .15s both; }
-@keyframes panelIn { from { opacity: 0; transform: translateY(24px) scale(.985); } to { opacity: 1; transform: none; } }
-@media (min-width: 1000px) {
-  html.three .card[data-panel] { width: min(680px, 48vw); margin-left: auto; animation-name: panelInSide; }
-  @keyframes panelInSide { from { opacity: 0; transform: translateX(48px); } to { opacity: 1; transform: none; } }
-}
-@media (max-width: 999px) {
-  html.three main { padding: 14px 16px 60px; }
-  html.three .card[data-panel] { margin-top: 34vh; }
-}
-html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); width: auto;
-  max-width: calc(100vw - 32px); margin: 0; padding: 10px 18px; text-align: center; font-size: 14px; color: var(--muted);
-  animation: hubIn 1s ease .9s both; }
-@keyframes hubIn { from { opacity: 0; } to { opacity: 1; } }
-.l3 { position: absolute; left: 0; top: 0; pointer-events: auto; display: flex; align-items: center; gap: 8px;
-  padding: 5px 13px 5px 5px; border-radius: 99px; background: rgba(9, 13, 23, .74); color: #dfe6f2;
-  border: 1px solid rgba(148, 170, 210, .24); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
-  font-size: 13.5px; white-space: nowrap; will-change: transform; transition: border-color .2s, background .2s, box-shadow .2s; }
-.l3 .n { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 99px;
-  border: 1.5px solid currentColor; font-size: 12px; font-weight: 700; flex: none; }
-.l3 .s { font-size: 12px; color: var(--muted); }
-.l3 .s:empty { display: none; }
-.l3:hover { border-color: var(--accent); }
-.l3.on { border-color: var(--accent); background: rgba(40, 72, 120, .6); box-shadow: 0 0 24px rgba(127, 182, 255, .4); color: #fff; }
-.l3.done .n { background: var(--ok); border-color: var(--ok); color: #06140c; }
-.l3.done .s { color: var(--ok); }
-.l3.run .s { color: var(--warn); }
 </style>
 </head>
 <body>
-<canvas id="scene" aria-hidden="true"></canvas>
-<div id="labels"></div>
-<main>
-  <div class="top">
-    <div>
-      <h1>Bias POC — ทดสอบอคติของโมเดล AI</h1>
-      <div class="sub">ถามคำถามเดียวกันโดยเปลี่ยนแค่กลุ่มของคน แล้วดูว่าโมเดลเลือกต่างกันไหม · ผลทั้งหมดเป็นแบบสำรวจ (exploratory)</div>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">B</div>
+      <div><h1>Bias POC</h1><div class="sub">ทดสอบอคติของโมเดล AI</div></div>
     </div>
-    <div class="tool">
+    <div class="navlabel">ขั้นตอน</div>
+    <nav class="steps" id="steps">
+      <button data-step="1"><span class="n">1</span>เลือกโมเดล</button>
+      <button data-step="2"><span class="n">2</span>ชุดคำถาม</button>
+      <button data-step="3"><span class="n">3</span>รัน</button>
+      <button data-step="4"><span class="n">4</span>ตรวจโดยคน</button>
+      <button data-step="5"><span class="n">5</span>สรุป & เทียบ</button>
+      <div class="sep"></div>
+      <button data-step="adv"><span class="n">⚙</span>ขั้นสูง</button>
+    </nav>
+    <div class="side-foot">
       <div class="chips" id="status_chips"></div>
-      <button class="ghost small" id="sfx_toggle" data-sfx="none"></button>
-      <button class="ghost small" id="view_toggle" data-sfx="none"></button>
+      <div class="tool"><button class="ghost small" id="sfx_toggle" data-sfx="none"></button></div>
     </div>
-  </div>
-
-  <nav class="steps" id="steps">
-    <button data-step="hub" class="adv"><span class="n">◎</span>ภาพรวม</button>
-    <button data-step="1"><span class="n">1</span>เลือกโมเดล</button>
-    <button data-step="2"><span class="n">2</span>ชุดคำถาม</button>
-    <button data-step="3"><span class="n">3</span>รัน</button>
-    <button data-step="4"><span class="n">4</span>ตรวจโดยคน</button>
-    <button data-step="5"><span class="n">5</span>สรุป & เทียบ</button>
-    <button data-step="adv" class="adv"><span class="n">⚙</span>ขั้นสูง</button>
-  </nav>
-
-  <!-- ======================= 3D OVERVIEW (3D mode only) ======================= -->
-  <section class="card hubnote" data-panel="hub" hidden>
-    <b style="color:var(--ink)">ภาพรวม</b> · คลิกวัตถุหรือป้ายชื่อเพื่อเข้าไปในแต่ละขั้นตอน · กดปุ่ม ◎ ภาพรวม ด้านบนเพื่อกลับมาที่นี่
-  </section>
+  </aside>
+<div class="content">
+<main>
 
   <!-- ======================= STEP 1: MODELS ======================= -->
   <section class="card" data-panel="1">
-    <h2>① เลือกโมเดลที่จะทดสอบ</h2>
+    <div class="eyebrow">ขั้นที่ 1 จาก 5</div>
+    <h2>เลือกโมเดลที่จะทดสอบ</h2>
     <p class="sub">ครั้งแรกแนะนำให้เริ่มจาก <b>โมเดลฟรี 1 ตัว</b> เพื่อดูการทำงานทั้งหมดก่อน แล้วค่อยเพิ่มโมเดลอื่นมาเทียบ</p>
     <div class="choices two" id="model_cards"></div>
     <div class="row between">
@@ -1636,7 +1608,8 @@ html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: 
 
   <!-- ======================= STEP 2: QUESTION SET ======================= -->
   <section class="card" data-panel="2" hidden>
-    <h2>② เลือกชุดคำถาม</h2>
+    <div class="eyebrow">ขั้นที่ 2 จาก 5</div>
+    <h2>เลือกชุดคำถาม</h2>
     <p class="sub">ทุกชุดมี <b>ข้อสอบควบคุม</b> (คำถามง่ายที่มีเฉลย ใช้เช็คว่าโมเดลเข้าใจภาษาไทย) ปนอยู่ด้วย</p>
     <div class="choices three" id="qset_cards"></div>
     <details id="opts">
@@ -1658,7 +1631,8 @@ html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: 
 
   <!-- ======================= STEP 3: RUN ======================= -->
   <section class="card" data-panel="3" hidden>
-    <h2>③ รันทดสอบ</h2>
+    <div class="eyebrow">ขั้นที่ 3 จาก 5</div>
+    <h2>รันทดสอบ</h2>
     <div class="recap" id="recap"></div>
     <label for="run_id">ชื่อ run (ตั้งให้อัตโนมัติ แก้ได้)</label>
     <div class="row" style="margin-top:0"><input type="text" id="run_id" list="run_ids" style="max-width:420px;flex:1">
@@ -1681,7 +1655,8 @@ html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: 
 
   <!-- ======================= STEP 4: HUMAN REVIEW ======================= -->
   <section class="card" data-panel="4" hidden>
-    <h2>④ งานที่ต้องให้คนตรวจ / ยืนยัน</h2>
+    <div class="eyebrow">ขั้นที่ 4 จาก 5</div>
+    <h2>งานที่ต้องให้คนตรวจ / ยืนยัน</h2>
     <label for="r4">Run</label>
     <select id="r4" style="max-width:520px"></select>
     <ul class="todo" id="todo"></ul>
@@ -1719,7 +1694,8 @@ html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: 
 
   <!-- ======================= STEP 5: SUMMARY & COMPARE ======================= -->
   <section class="card" data-panel="5" hidden>
-    <h2>⑤ สรุปผล & เทียบกับโมเดลอื่น</h2>
+    <div class="eyebrow">ขั้นที่ 5 จาก 5</div>
+    <h2>สรุปผล & เทียบกับโมเดลอื่น</h2>
     <label for="r5">Run</label>
     <select id="r5" style="max-width:520px"></select>
     <div id="sum_head"></div>
@@ -1741,7 +1717,8 @@ html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: 
 
   <!-- ======================= ADVANCED ======================= -->
   <section class="card" data-panel="adv" hidden>
-    <h2>⚙ ขั้นสูง</h2>
+    <div class="eyebrow">เครื่องมือ</div>
+    <h2>ขั้นสูง</h2>
     <p class="sub">คำสั่งเดิมของ spike.py สำหรับตรวจละเอียด ทุกปุ่มเท่ากับรันคำสั่งเดียวกับ CLI</p>
     <h3>Runs ทั้งหมด</h3>
     <div class="scroll"><table>
@@ -1767,6 +1744,8 @@ html.three .card.hubnote { position: fixed; left: 50%; bottom: 26px; transform: 
     <pre class="log" id="a_out"></pre>
   </section>
 </main>
+</div>
+</div>
 
 <script>
 const TOKEN = "__TOKEN__";
@@ -1785,18 +1764,7 @@ let QSET = null;       // selected question-set file
 let CUR = null;        // "db|run_id" of the run being reviewed/summarised
 let outLen = 0, polling = null, lastJob = null;
 let sawRunning = false;  // this page saw the job running (so "finished" is news, worth a sound)
-let DONE = {};         // which steps are complete (for the 3D scene)
-let JOBINFO = {};      // job progress (for the 3D scene)
-const three = () => document.documentElement.classList.contains("three");
 const sfx = (name, ...a) => { try { window.SFX && SFX[name] && SFX[name](...a); } catch (e) {} };
-const emit = (name, detail) => window.dispatchEvent(new CustomEvent(name, {detail}));
-window.biasState = () => ({step: STEP, done: DONE, job: JOBINFO});
-window.disable3D = (err) => {   // called by static/scene3d.js if it cannot start
-  document.documentElement.classList.remove("three", "three-ready");
-  if (STEP === "hub") go(1);
-  renderToggles();
-  if (err) console.warn("3D view off:", err);
-};
 
 async function api(path, body) {
   const opt = {headers: {"X-Token": TOKEN}};
@@ -1818,30 +1786,26 @@ function go(step) {
   if (STEP === "5") { fillRunSelect("r5"); loadSummary(); }
   if (STEP === "adv") renderAdvanced();
   window.scrollTo({top: 0, behavior: "smooth"});
-  emit("bias:step", {step: STEP});
 }
 function markDone() {
   const done = {"1": !!(SEL && SEL.size > 0), "2": !!QSET, "3": !!CUR};
   document.querySelectorAll("#steps button").forEach(b => b.classList.toggle("done", !!done[b.dataset.step]));
-  DONE = done; emit("bias:done", done);
 }
 
-/* ----------------------------- sound + view toggles ----------------------------- */
+/* ----------------------------- sound toggle ----------------------------- */
 function renderToggles() {
   $("sfx_toggle").textContent = window.SFX && SFX.muted ? "🔇 เสียงปิด" : "🔊 เสียงเปิด";
   $("sfx_toggle").hidden = !window.SFX;
-  $("view_toggle").textContent = three() ? "มุมมอง 2D" : "มุมมอง 3D";
 }
 $("sfx_toggle").addEventListener("click", () => {
   SFX.setMuted(!SFX.muted); if (!SFX.muted) sfx("click"); renderToggles();
 });
-$("view_toggle").addEventListener("click", () => { store.set("bias_view", three() ? "2d" : "3d"); location.reload(); });
 // A soft click for every button / choice / dropdown / checkbox. Clicking a label's text also
 // fires a second, synthetic click on its input right after; skip it so one click = one sound.
 let lastClickSfx = -1e9;
 document.addEventListener("click", e => {
   const el = e.target.closest("button, .choice, summary, select, input[type=checkbox], label:has(input[type=checkbox])");
-  if (!el || el.closest("#labels") || e.timeStamp - lastClickSfx < 60) return;
+  if (!el || e.timeStamp - lastClickSfx < 60) return;
   const k = el.dataset.sfx || (el.closest("[data-sfx]") || {dataset: {}}).dataset.sfx;
   if (k === "none") return;
   lastClickSfx = e.timeStamp;
@@ -1986,7 +1950,6 @@ async function poll() {
   // progress from spike.py lines like "[12/34] model prompt ok"
   const m = [...$("out").textContent.matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
   const k = m ? +m[1] : 0, n = m ? +m[2] : 0;
-  JOBINFO = {running: j.running, k, n, exit: j.exit_code, isRun}; emit("bias:job", JOBINFO);
   if (isRun) {
     $("prog").querySelector("div").style.width = n ? (100 * k / n) + "%" : (j.running ? "3%" : "0");
     $("prog_txt").textContent = j.running ? (n ? `กำลังรัน ${k}/${n} …` : "กำลังเริ่ม…") : "";
@@ -2358,12 +2321,7 @@ $("detail_body").addEventListener("click", async e => {
 /* ----------------------------- boot ----------------------------- */
 $("steps").addEventListener("click", e => { const b = e.target.closest("button[data-step]"); if (b) go(b.dataset.step); });
 renderToggles();
-refresh().then(() => { go(three() ? "hub" : 1); if (S.job.running || S.job.argv.length) startPolling(); });
-</script>
-<script type="module">
-// The 3D scene is loaded only in 3D mode, so the 2D page never downloads three.js.
-if (document.documentElement.classList.contains("three"))
-  import("/static/scene3d.js").catch(err => window.disable3D(err));
+refresh().then(() => { go(1); if (S.job.running || S.job.argv.length) startPolling(); });
 </script>
 </body>
 </html>
