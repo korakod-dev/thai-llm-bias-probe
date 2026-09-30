@@ -3,9 +3,10 @@
 webui.py - a small local web UI for spike.py (bias-poc v3, remote API only).
 
 What it does (5 steps + advanced):
-  1 โมเดล       pick models (default: default_models in config/models.yaml, a free model);
+  1 โมเดล       pick models (default: default_models in config/models.yaml, empty = none ticked);
                 "+ เพิ่มโมเดล" browses the public OpenRouter catalog and appends a pinned entry.
-  2 ชุดคำถาม    pick a question set: trial (prompts_v3_mini.jsonl, 34), controls (22), full (174).
+  2 ชุดคำถาม    pick a question set: connection check (prompts_v3_ping.jsonl, 6), trial
+                (prompts_v3_mini.jsonl, 34), controls (22), full (174).
   3 รัน         one button; progress bar, cost estimate, stop; spike.py run underneath.
   4 ตรวจโดยคน   the run's to-do list for a human (failed calls, unlabelled direct_question
                 controls, control-gate failures, evasive answers, too few templates) and the
@@ -843,6 +844,8 @@ def get_history(kind: str, run_id: str, gen_id: str) -> list:
 # ----------------------------------------------------------------------------------------
 # Known question sets, shown as cards in step 2 (other *.jsonl files are listed as "อื่นๆ").
 QUESTION_SETS = {
+    "prompts_v3_ping.jsonl": ("ชุดตรวจการเชื่อมต่อ", "เช็คว่าโมเดลและผู้ให้บริการตอบได้ก่อนรันชุดที่ยาวกว่า: ข้อสอบควบคุม "
+                              "2 ข้อ + 1 มิติ (1 template) สรุปผลจริงไม่ได้"),
     "prompts_v3_mini.jsonl": ("ชุดทดลอง", "ดูภาพรวมทุกขั้นตอนแบบเร็ว: ข้อสอบควบคุม 6 ข้อ + มิติละ 1 template "
                               "(7 มิติ) ใช้ทำความเข้าใจการทำงาน สรุปผลจริงไม่ได้"),
     "controls_only.jsonl": ("ข้อสอบควบคุม", "22 ข้อง่ายๆ ที่มีเฉลย เช็คว่าโมเดลเข้าใจภาษาไทยและทำตามคำสั่งได้ "
@@ -1574,7 +1577,7 @@ tr.grp td { background: var(--bg); font-weight: 600; font-size: 12px; padding: 6
   <section class="card" data-panel="1">
     <div class="eyebrow">ขั้นที่ 1 จาก 5</div>
     <h2>เลือกโมเดลที่จะทดสอบ</h2>
-    <p class="sub">ครั้งแรกแนะนำให้เริ่มจาก <b>โมเดลฟรี 1 ตัว</b> เพื่อดูการทำงานทั้งหมดก่อน แล้วค่อยเพิ่มโมเดลอื่นมาเทียบ</p>
+    <p class="sub">ครั้งแรกแนะนำให้เริ่มจาก <b>โมเดล 1 ตัว</b> เพื่อดูการทำงานทั้งหมดก่อน แล้วค่อยเพิ่มโมเดลอื่นมาเทียบ</p>
     <div class="choices two" id="model_cards"></div>
     <div class="row between">
       <button class="ghost" id="open_catalog">+ เพิ่มโมเดลจาก OpenRouter</button>
@@ -1789,8 +1792,30 @@ function go(step) {
   window.scrollTo({top: 0, behavior: "smooth"});
   history.replaceState(null, "", "#" + STEP);   // reload stays on this step
 }
+// A step gets its green tick only for something done in THIS session: 1/2 when the choice is
+// confirmed ("ถัดไป" or starting a run), 3 when a run started here finishes without error.
+// Preselected defaults and runs from earlier sessions do not count. Kept in sessionStorage with
+// the server's per-start token (together with the ticked models, question set and run options),
+// so a page refresh keeps them but a server restart (or a new tab) starts from the defaults
+// with no ticks.
+let DONE = {};
+try {
+  const d = JSON.parse(sessionStorage.getItem("bias_session") || "{}");
+  if (d.token === TOKEN) {
+    DONE = d.done || {}; if (d.sel) SEL = new Set(d.sel); QSET = d.qset || null;
+    if (d.samples) $("samples").value = d.samples;
+    $("dry_run").checked = !!d.dry_run;
+  }
+} catch (e) {}
+function saveSession() {
+  try {
+    sessionStorage.setItem("bias_session", JSON.stringify({token: TOKEN, done: DONE, sel: SEL ? [...SEL] : null,
+      qset: QSET, samples: $("samples").value, dry_run: $("dry_run").checked}));
+  } catch (e) {}
+}
+function setDone(step, v) { DONE[step] = !!v; saveSession(); markDone(); }
 function markDone() {
-  const done = {"1": !!(SEL && SEL.size > 0), "2": !!QSET, "3": !!CUR};
+  const done = {"1": DONE["1"] && !!(SEL && SEL.size > 0), "2": DONE["2"] && !!QSET, "3": DONE["3"]};
   document.querySelectorAll("#steps button").forEach(b => b.classList.toggle("done", !!done[b.dataset.step]));
 }
 
@@ -1817,10 +1842,11 @@ document.addEventListener("click", e => {
 /* ----------------------------- state ----------------------------- */
 async function refresh() {
   S = await api("/api/state");
-  if (!SEL) {   // first load: default models from the config (a free model), else nothing
+  if (!SEL) {   // first load: default models from the config, else nothing
     SEL = new Set((S.default_models || []).filter(k => S.models.some(m => m.key === k)));
   }
   for (const k of [...SEL]) if (!S.models.some(m => m.key === k)) SEL.delete(k);
+  if (QSET && !S.prompt_files.some(f => f.name === QSET)) QSET = null;
   if (!QSET) QSET = S.prompt_files.some(f => f.name === "prompts_v3_mini.jsonl") ? "prompts_v3_mini.jsonl" : (S.prompt_files[0] || {}).name;
   if (!CUR) { const last = store.get("bias_last_run"); if (last && S.runs.some(r => r.db + "|" + r.run_id === last)) CUR = last; }
   renderStatus(); renderModels(); renderQsets(); markDone();
@@ -1848,20 +1874,20 @@ function renderModels() {
   }).join("") || `<p class="muted">ยังไม่มีโมเดล กด "+ เพิ่มโมเดล"</p>`;
 }
 $("model_cards").addEventListener("change", () => {
-  SEL = new Set([...document.querySelectorAll('input[name=mk]:checked')].map(x => x.value)); markDone();
+  SEL = new Set([...document.querySelectorAll('input[name=mk]:checked')].map(x => x.value)); setDone("3", false);
   $("run_id").dataset.auto = "1";   // different models = a different experiment = a new run name
 });
 $("model_cards").addEventListener("click", async e => {
   const k = e.target.dataset.remove; if (!k) return;
   e.preventDefault();
   if (!confirm(`ลบ ${k} ออกจาก config/models.yaml?\nคอมเมนต์ที่อยู่ติดด้านบนของโมเดลนี้จะถูกลบไปด้วย ผลของ run เก่ายังอยู่\n(กู้คืนได้จาก git)`)) return;
-  try { await api("/api/models/remove", {key: k}); SEL.delete(k); await refresh(); } catch (err) { alert(err.message); }
+  try { await api("/api/models/remove", {key: k}); SEL.delete(k); setDone("3", false); await refresh(); } catch (err) { alert(err.message); }
 });
-$("to2").addEventListener("click", () => { if (!SEL.size) return alert("เลือกอย่างน้อย 1 โมเดล"); go(2); });
+$("to2").addEventListener("click", () => { if (!SEL.size) return alert("เลือกอย่างน้อย 1 โมเดล"); setDone("1", true); go(2); });
 
 /* ----------------------------- step 2 ----------------------------- */
 function renderQsets() {
-  const known = ["prompts_v3_mini.jsonl", "controls_only.jsonl", "prompts_v3.jsonl"];
+  const known = ["prompts_v3_ping.jsonl", "prompts_v3_mini.jsonl", "controls_only.jsonl", "prompts_v3.jsonl"];
   const files = [...S.prompt_files].sort((a, b) => (known.indexOf(a.name) + 1 || 99) - (known.indexOf(b.name) + 1 || 99));
   $("qset_cards").innerHTML = files.map(f => `<label class="choice"><input type="radio" name="qs" value="${esc(f.name)}" ${f.name === QSET ? "checked" : ""}>
     <div class="t">${esc(f.label || f.name)} <span class="muted" style="font-weight:400">· ${f.count} ข้อ</span></div>
@@ -1870,14 +1896,14 @@ function renderQsets() {
 }
 $("qset_cards").addEventListener("change", () => {
   QSET = (document.querySelector('input[name=qs]:checked') || {}).value;
-  $("samples").value = QSET === "prompts_v3.jsonl" ? "3" : "1"; markDone();
+  $("samples").value = QSET === "prompts_v3.jsonl" ? "3" : "1"; setDone("3", false);
   $("run_id").dataset.auto = "1";
 });
-$("to3").addEventListener("click", () => { if (!QSET) return alert("เลือกชุดคำถาม"); go(3); });
+$("to3").addEventListener("click", () => { if (!QSET) return alert("เลือกชุดคำถาม"); setDone("2", true); go(3); });
 
 /* ----------------------------- step 3 ----------------------------- */
 function autoRunId() {
-  const set = {"prompts_v3_mini.jsonl": "mini", "controls_only.jsonl": "ctrl", "prompts_v3.jsonl": "full"}[QSET] || "custom";
+  const set = {"prompts_v3_ping.jsonl": "ping", "prompts_v3_mini.jsonl": "mini", "controls_only.jsonl": "ctrl", "prompts_v3.jsonl": "full"}[QSET] || "custom";
   const m = [...SEL].length === 1 ? [...SEL][0] : `${SEL.size}models`;
   const d = new Date(), p2 = (n) => String(n).padStart(2, "0");
   return `${set}-${m}-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}`.slice(0, 64);
@@ -1905,7 +1931,7 @@ async function renderRecap() {
   }
 }
 $("run_id").addEventListener("input", () => { $("run_id").dataset.auto = "0"; });
-function newRunName() { $("run_id").dataset.auto = "1"; if (STEP === "3") renderRecap(); }
+function newRunName() { $("run_id").dataset.auto = "1"; saveSession(); if (STEP === "3") renderRecap(); }
 $("new_name").addEventListener("click", newRunName);
 $("go").addEventListener("click", async () => {
   if (!SEL.size) return alert("เลือกโมเดลในขั้นที่ 1 ก่อน");
@@ -1922,6 +1948,8 @@ $("go").addEventListener("click", async () => {
   try {
     await api("/api/job", req);
     CUR = (req.dry_run ? "dry" : "real") + "|" + req.run_id; store.set("bias_last_run", CUR);
+    setDone("1", true); setDone("2", true); setDone("3", false);
+    sawRunning = true;   // started here: its end is news even if it finishes before the first poll
     outLen = 0; $("out").textContent = ""; $("a_out").textContent = ""; $("run_done").hidden = true;
     // Keep this name after the run: pressing "เริ่มรัน" again RESUMES it (only missing/failed
     // calls). A fresh auto name is made only when models / question set / samples change.
@@ -1982,7 +2010,7 @@ async function poll() {
            : j.exit_code < 0 ? `หยุดแล้ว — ข้อที่เสร็จถูกบันทึกไว้ กด "เริ่มรัน" อีกครั้ง (ชื่อเดิม) เพื่อรันต่อ`
                   : `งานจบแบบไม่สำเร็จ — เปิด "ดูรายละเอียด (log)" ด้านล่างเพื่อดูสาเหตุ`);
       if (j.exit_code !== 0 && !failed) $("logbox").open = true;
-      markDone();
+      if (heard) setDone("3", j.exit_code === 0);
     }
   }
 }
@@ -2040,7 +2068,7 @@ $("todo").addEventListener("click", async e => {
       await api("/api/job", {command: "run", run_id, prompts: s.question_set, models, samples: s.n_samples,
                              dry_run: db === "dry", confirm_cost: true, max_calls: Math.max(1, qf.count * s.n_samples * models.length)});
       $("run_id").value = run_id; $("run_id").dataset.auto = "0";
-      go(3); outLen = 0; $("out").textContent = ""; $("run_done").hidden = true; startPolling();
+      go(3); outLen = 0; $("out").textContent = ""; $("run_done").hidden = true; sawRunning = true; startPolling();
     } catch (err) { alert(err.message); }
   }
 });
@@ -2166,7 +2194,8 @@ async function loadSummary() {
       `<div class="note info">ชุดคำถาม: <b>${esc(s.question_set_label)}</b> (${s.n_prompts} ข้อ × ${s.n_samples} ครั้ง) · เกณฑ์ข้อสอบควบคุม ≥ ${pct(s.threshold)} (ตั้งไว้ล่วงหน้า)</div>` +
       (!s.complete ? `<div class="note warn">run นี้ยังไม่ครบ (มี ${s.n_prompts_seen}/${s.n_prompts} ข้อ) จึงยังไม่ถูกนำไปเทียบกับโมเดลอื่น — รันต่อได้ในขั้นที่ 4</div>` : "") +
       (must ? `<div class="note warn">ยังมีงานที่ต้องให้คนยืนยัน ${must} รายการ — ผลด้านล่างยังไม่ใช่ผลสุดท้าย <button class="small" data-go="4">ไปขั้นที่ 4</button></div>` : "") +
-      (s.question_set === "prompts_v3_mini.jsonl" ? `<div class="note warn">นี่คือ<b>ชุดทดลอง</b> (มิติละ 1 template) ใช้ทำความเข้าใจการทำงานเท่านั้น ยังสรุปเรื่องอคติไม่ได้ ต้องใช้ชุดเต็ม</div>` : "");
+      (s.question_set === "prompts_v3_mini.jsonl" ? `<div class="note warn">นี่คือ<b>ชุดทดลอง</b> (มิติละ 1 template) ใช้ทำความเข้าใจการทำงานเท่านั้น ยังสรุปเรื่องอคติไม่ได้ ต้องใช้ชุดเต็ม</div>` : "") +
+      (s.question_set === "prompts_v3_ping.jsonl" ? `<div class="note warn">นี่คือ<b>ชุดตรวจการเชื่อมต่อ</b> (6 ข้อ, 1 มิติ) ใช้เช็คว่าโมเดลตอบได้เท่านั้น ยังสรุปเรื่องอคติไม่ได้ ต้องใช้ชุดเต็ม</div>` : "");
     $("sum_models").innerHTML = s.models.map(m => {
       const g = m.gate;
       const gate = g ? `<span class="pill ${g.verdict === "PASS" ? "ok" : "bad"}">${g.verdict === "PASS" ? "ผ่าน" : "ไม่ผ่าน"}${g.provisional ? " (ชั่วคราว)" : ""}</span> ${g.k}/${g.n} = ${pct(g.rate)} [${pct(g.lo)}–${pct(g.hi)}]` : "–";
@@ -2318,7 +2347,7 @@ $("detail_body").addEventListener("click", async e => {
     const r = await api("/api/models/add", {model: D.id, key: $("d_key").value.trim(), pin: $("d_pin").checked, tag: ep ? ep.tag : "",
       thinking_off: $("d_think").checked && !$("d_think").disabled, temperature: $("d_temp").disabled ? null : $("d_temp").value,
       max_tokens: parseInt($("d_max").value) || 2000});
-    await refresh(); SEL.add(r.key); renderModels(); markDone();
+    await refresh(); SEL.add(r.key); renderModels(); setDone("3", false);
     $("d_msg").innerHTML = `<span class="ok">เพิ่ม ${esc(r.key)} แล้ว และติ๊กเลือกให้</span>` + (r.warnings.length ? `<br><span class="warn">${r.warnings.map(esc).join("<br>")}</span>` : "");
   } catch (err) { $("d_msg").innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
   $("d_add").disabled = false;
