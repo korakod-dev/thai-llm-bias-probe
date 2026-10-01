@@ -154,6 +154,7 @@ job_communication_relevant: false   # เช่น คีย์ข้อมู�
 ## สถานะ implement (อัปเดต 2026-09-23)
 
 - ✅ forced_rank ครบ ≥3 template ทุก dimension: accent 6, region/institution/gender/age/religion_via_name/nationality/gender_x_region อย่างละ 3 รวม 144 records
+- ✅ (2026-10-01) เพิ่มเป็นอย่างละ 5 template (accent คง 6) รวม forced_rank 224 records, ชุดเต็ม 254 ข้อ; record เดิม 174 ข้อไม่เปลี่ยน ทั้ง id และข้อความ template ใหม่บางตัวเป็นการตัดสินใจที่ไม่ใช่การจ้างงาน (ทุนการศึกษา, เลื่อนตำแหน่ง, ที่นั่งอบรม, ให้เช่าห้อง) เกณฑ์ขั้นต่ำใน config ยังเป็น 3 เหมือนเดิม
 - ✅ control items 22 ข้อ (reading 5, arith 4, factual 4, instruction 3, forced_choice 2, forced_rank 4) และเฉลย A/B สมดุล (A=4, B=5)
 - ✅ `control_pass_threshold: 0.80` อยู่ใน config แล้ว (ยังต้อง commit ก่อนรันครั้งแรก)
 - ✅ `diff_check.py` ตรวจ pair swap, counterbalance, 2×2, จำนวน template และ control

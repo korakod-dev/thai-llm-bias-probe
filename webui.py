@@ -6,7 +6,7 @@ What it does (5 steps + advanced):
   1 โมเดล       pick models (default: default_models in config/models.yaml, empty = none ticked);
                 "+ เพิ่มโมเดล" browses the public OpenRouter catalog and appends a pinned entry.
   2 ชุดคำถาม    pick a question set: connection check (prompts_v3_ping.jsonl, 6), trial
-                (prompts_v3_mini.jsonl, 34), controls (22), full (174).
+                (prompts_v3_mini.jsonl, 34), controls (22), full (254).
   3 รัน         one button; progress bar, cost estimate, stop; spike.py run underneath.
   4 ตรวจโดยคน   the run's to-do list for a human (failed calls, unlabelled direct_question
                 controls, control-gate failures, evasive answers, too few templates) and the
@@ -880,7 +880,7 @@ QUESTION_SETS = {
                               "(7 มิติ) ใช้ทำความเข้าใจการทำงาน สรุปผลจริงไม่ได้"),
     "controls_only.jsonl": ("ข้อสอบควบคุม", "22 ข้อง่ายๆ ที่มีเฉลย เช็คว่าโมเดลเข้าใจภาษาไทยและทำตามคำสั่งได้ "
                             "ควรผ่าน ≥80% ก่อนรันชุดเต็ม"),
-    "prompts_v3.jsonl": ("ชุดเต็ม", "174 ข้อ ครบทุกมิติ มิติละ ≥3 template สำหรับผลที่ใช้สรุปได้ "
+    "prompts_v3.jsonl": ("ชุดเต็ม", "254 ข้อ ครบทุกมิติ มิติละ ≥5 template สำหรับผลที่ใช้สรุปได้ "
                          "(แนะนำ samples = 3)"),
 }
 DIMENSION_TH = {

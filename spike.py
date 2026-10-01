@@ -45,13 +45,13 @@ Usage:
   # 2) Is the seed honoured through the API? (calls the same prompt twice with the same seed)
   python spike.py repro-check --model or-qwen35-9b --prompts prompts_v3.jsonl
 
-  # 3) Controls first (22 items, cheap), then the full v3 run (174 items; raise --max-calls
+  # 3) Controls first (22 items, cheap), then the full v3 run (254 items; raise --max-calls
   #    for --samples > 1). Paid calls ask for confirmation unless --yes is given.
   #    Always name the models with --model: without it EVERY model in the config is used,
   #    and resuming a run later only works with the same model set (it is in config_hash).
   python spike.py run --run-id v3-or-ctrl-001 --prompts controls_only.jsonl \
       --model or-qwen35-9b --model or-gemma4-31b
-  python spike.py run --run-id v3-or-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 1200 \
+  python spike.py run --run-id v3-or-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 1600 \
       --model or-qwen35-9b --model or-gemma4-31b
   python spike.py summary --run-id v3-or-001
   python spike.py score --run-id v3-or-001
