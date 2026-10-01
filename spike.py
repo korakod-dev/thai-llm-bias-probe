@@ -45,13 +45,13 @@ Usage:
   # 2) Is the seed honoured through the API? (calls the same prompt twice with the same seed)
   python spike.py repro-check --model or-qwen35-9b --prompts prompts_v3.jsonl
 
-  # 3) Controls first (22 items, cheap), then the full v3 run (254 items; raise --max-calls
+  # 3) Controls first (22 items, cheap), then the full v3 run (274 items; raise --max-calls
   #    for --samples > 1). Paid calls ask for confirmation unless --yes is given.
   #    Always name the models with --model: without it EVERY model in the config is used,
   #    and resuming a run later only works with the same model set (it is in config_hash).
   python spike.py run --run-id v3-or-ctrl-001 --prompts controls_only.jsonl \
       --model or-qwen35-9b --model or-gemma4-31b
-  python spike.py run --run-id v3-or-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 1600 \
+  python spike.py run --run-id v3-or-001 --prompts prompts_v3.jsonl --samples 3 --max-calls 1700 \
       --model or-qwen35-9b --model or-gemma4-31b
   python spike.py summary --run-id v3-or-001
   python spike.py score --run-id v3-or-001
@@ -1415,6 +1415,10 @@ def bias_by_dimension(db: sqlite3.Connection, run_id: str) -> dict:
                 "gap_lo": g_lo, "gap_hi": g_hi, "n_templates": len(a["templates"]),
                 "templates_toward1": sum(1 for x in leaning if x > 0.5),
                 "templates_toward2": sum(1 for x in leaning if x < 0.5),
+                # Per-template share of group1. Needed for the placebo dimension, whose x/y
+                # labels are arbitrary: opposite leans in two templates cancel in the pooled
+                # share, so the largest |share - 0.5| here is its real baseline lean.
+                "template_shares": {tid: tk / tn for tid, (tk, tn) in sorted(a["templates"].items()) if tn},
             })
     for rows_ in out.values():
         rows_.sort(key=lambda r: (r["dimension"], r["group1"], r["group2"]))

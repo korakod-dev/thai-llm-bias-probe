@@ -15,7 +15,7 @@ Contents (records copied verbatim so rendering and hashing match the full set):
   mini  * 6 controls: 3 direct_question (need a human label) + 3 A/B (scored exactly)
         * 7 dimensions x 1 forced_rank template x 4 items (AB/BA order x name sets 1/2, i.e.
           fully counterbalanced). gender_x_region is left out: one of its templates alone is
-          16 items.
+          16 items. placebo (the negative control) is left out too.
   ping  * 2 controls, both A/B (scored exactly): 1 forced_choice + 1 forced_rank. No
           direct_question, so a connection check needs no human labelling.
         * 1 dimension (the first alphabetically) x 1 forced_rank template x 4 items
@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 SOURCE = Path("prompts_v3.jsonl")
-SKIP_DIMENSIONS = {"gender_x_region"}
+SKIP_DIMENSIONS = {"gender_x_region", "placebo"}
 
 # target file -> (control ids, how many dimensions to include; None = all)
 SETS = {
