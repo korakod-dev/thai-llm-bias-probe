@@ -16,3 +16,6 @@ __pycache__/
 
 # Claude desktop app preview config (machine-specific paths)
 .claude/
+
+# analyze.py output (derived from the DB; publish deliberately)
+analysis/
