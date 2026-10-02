@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-webui.py - a small local web UI for spike.py (bias-poc v3, remote API only).
+webui.py - a small local web UI for spike.py (thai-llm-bias-probe v3, remote API only).
 
 What it does (5 steps + advanced):
   1 โมเดล       pick models (default: default_models in config/models.yaml, empty = none ticked);
@@ -351,7 +351,7 @@ def fetch_json(url: str, timeout: float = 20) -> Any:
     """GET a public OpenRouter URL. No credentials are attached."""
     if not url.startswith(OPENROUTER_API + "/"):
         raise RuntimeError("refusing to fetch a non-OpenRouter URL")
-    req = urllib.request.Request(url, headers={"User-Agent": "bias-poc-webui/1", "Accept": "application/json"})
+    req = urllib.request.Request(url, headers={"User-Agent": "thai-llm-bias-probe-webui/1", "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read(8_000_000).decode("utf-8"))
@@ -1250,7 +1250,7 @@ def estimate(req: dict) -> dict:
 # HTTP
 # ----------------------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-    server_version = "bias-poc-webui"
+    server_version = "thai-llm-bias-probe-webui"
 
     def log_message(self, fmt: str, *args: Any) -> None:  # keep the terminal quiet
         pass
@@ -1386,7 +1386,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bias POC Runner</title>
+<title>Thai LLM Bias Probe</title>
 <script src="/static/sfx.js"></script>
 <style>
 :root {
@@ -1591,7 +1591,7 @@ tr.grp td { background: var(--bg); font-weight: 600; font-size: 12px; padding: 6
   <aside class="side">
     <div class="brand">
       <div class="logo">B</div>
-      <div><h1>Bias POC</h1><div class="sub">ทดสอบอคติของโมเดล AI</div></div>
+      <div><h1>Thai LLM Bias Probe</h1><div class="sub">ทดสอบอคติของโมเดล AI</div></div>
     </div>
     <div class="navlabel">ขั้นตอน</div>
     <nav class="steps" id="steps">
@@ -2534,7 +2534,7 @@ def main() -> int:
             sys.exit(f"Port {args.port} is still in use (see above). "
                      f"Pick another port: python3 webui.py --port {args.port + 1}")
         raise
-    print(f"Bias POC web UI: http://127.0.0.1:{args.port}  (Ctrl+C to stop)")
+    print(f"Thai LLM Bias Probe web UI: http://127.0.0.1:{args.port}  (Ctrl+C to stop)")
     if CONFIG != DEFAULT_CONFIG:
         print(f"config: {CONFIG}")
     missing = [m["api_key_env"] for m in load_models() if not m["key_set"]]

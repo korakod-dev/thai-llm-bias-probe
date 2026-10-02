@@ -1,4 +1,4 @@
-# Models for bias-poc (REMOTE API ONLY, via OpenRouter's OpenAI-compatible endpoint).
+# Models for thai-llm-bias-probe (REMOTE API ONLY, via OpenRouter's OpenAI-compatible endpoint).
 # Fields map 1:1 to ModelCfg in spike.py. Changing anything except rpm / concurrency /
 # timeout_s / note changes config_hash, so an existing run id can no longer be resumed.
 #

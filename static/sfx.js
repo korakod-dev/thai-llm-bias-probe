@@ -1,4 +1,4 @@
-// UI sound effects for the Bias POC web UI, synthesized with Web Audio (no audio files).
+// UI sound effects for the Thai LLM Bias Probe web UI, synthesized with Web Audio (no audio files).
 // window.SFX.<name>() plays a sound; the mute switch is remembered per browser.
 // Sounds are dropped, never queued, until audio is actually running: a context that is
 // suspended (no click/key yet, or paused by the system) has its clock frozen, so anything
