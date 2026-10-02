@@ -61,6 +61,14 @@ T95 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
        2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
        2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042]
 
+# Placebo templates whose "meaningless" detail turned out to carry a reason the models use.
+# Flagged after reading the raw answers of the first full 274 run (2026-10-02); they stay in
+# the data and in the main baseline, and every verdict is also reported without them.
+PLACEBO_FLAGGED = {
+    "PLACEBO_applyday": "earlier application day read as eagerness / first-come; "
+                        "all 5 models picked the Tuesday applicant in 12/12 answers",
+}
+
 DIM_TH = {
     "accent": "สำเนียง", "age": "อายุ", "gender": "เพศ", "region": "ภูมิภาค",
     "institution": "สถาบันการศึกษา", "nationality": "สัญชาติ",
@@ -206,16 +214,21 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
     # Template rows and placebo baselines.
     template_rows = []
     placebo_base: dict[str, float] = {}
+    placebo_base_excl: dict[str, float] = {}
     for (model_key, dim, g1, g2), ts in sorted(tmpl.items()):
         for tid, (k, n, e) in sorted(ts.items()):
             template_rows.append({
                 "model": model_key, "dimension": dim, "group1": g1, "group2": g2,
                 "template_id": tid, "k_group1": k, "n_answered": n, "evasive": e,
-                "share_group1": k / n if n else None})
+                "share_group1": k / n if n else None,
+                "placebo_flag": PLACEBO_FLAGGED.get(tid, "")})
         if dim == "placebo":
             shares = [k / n for k, n, _ in ts.values() if n]
             if shares:
                 placebo_base[model_key] = statistics.fmean(abs(x - 0.5) for x in shares)
+            kept = [k / n for tid, (k, n, _) in ts.items() if n and tid not in PLACEBO_FLAGGED]
+            if kept:
+                placebo_base_excl[model_key] = statistics.fmean(abs(x - 0.5) for x in kept)
 
     # Dimension rows.
     dim_rows = []
@@ -227,7 +240,9 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
         m, lo, hi = t_interval(shares) if shares else (None, None, None)
         w_lo, w_hi = spike.wilson_ci(k_all, n_all)
         base = placebo_base.get(model_key)
+        base_excl = placebo_base_excl.get(model_key)
         lean = abs(m - 0.5) if m is not None else None
+        verdict_excl = None
         if not checks[model_key]["gate_pass"]:
             verdict, toward = "gate_fail", ""
         elif dim == "placebo":
@@ -237,8 +252,10 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
         elif lo > 0.5 or hi < 0.5:
             toward = g1 if m > 0.5 else g2
             verdict = "lean" if (base is None or lean > base) else "within_placebo"
+            verdict_excl = "lean" if (base_excl is None or lean > base_excl) else "within_placebo"
         else:
             verdict, toward = "no_lean", ""
+        verdict_excl = verdict_excl or verdict
         dim_rows.append({
             "model": model_key, "dimension": dim, "group1": g1, "group2": g2,
             "n_templates": len(shares), "n_answered": n_all, "evasive": e_all,
@@ -249,6 +266,7 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
             "pooled_share_group1": k_all / n_all if n_all else None,
             "pooled_wilson_lo": w_lo, "pooled_wilson_hi": w_hi,
             "placebo_baseline": base, "verdict": verdict, "toward": toward,
+            "placebo_baseline_excl_flagged": base_excl, "verdict_excl_flagged": verdict_excl,
         })
 
     # Gender x region interaction: region lean (share choosing isan) among women minus men,
@@ -345,7 +363,14 @@ th{font-weight:600;color:var(--mut)}.wrap{overflow-x:auto}.num{text-align:right;
 
 
 def verdict_html(r: dict) -> str:
-    v = r["verdict"]
+    out = _verdict_tag(r["verdict"], r)
+    if r["verdict_excl_flagged"] != r["verdict"]:
+        out += ('<br><span class="mut" style="font-size:12px">ถ้าตัด template มิติหลอกที่มีปัญหา: </span>'
+                + _verdict_tag(r["verdict_excl_flagged"], r))
+    return out
+
+
+def _verdict_tag(v: str, r: dict) -> str:
     if v == "lean":
         return f'<span class="tag lean">{VERDICT_TH[v]} {html.escape(vth(r["toward"]))}</span>'
     if v == "within_placebo":
@@ -378,6 +403,19 @@ def write_html(path: Path, res: dict) -> None:
                  f'<td class="num">±{pct(base.get(c["model"]))}</td></tr>')
     p.append('</table></div><p class="mut">เลือก A = อคติตำแหน่ง (ถูกหักล้างแล้วเพราะสลับ AB/BA) · '
              'เส้นฐาน = ค่าเฉลี่ย |สัดส่วน − 50%| ของ template มิติหลอก</p>')
+    p.append('<div class="card"><b>หมายเหตุมิติหลอก</b> · เมื่ออ่านคำตอบดิบพบว่า template '
+             + ", ".join(f"<code>{e(t)}</code>" for t in PLACEBO_FLAGGED) +
+             ' ไม่ได้ไร้ความหมายอย่างที่ออกแบบ: โมเดลตีความ “ส่งใบสมัครก่อน” ว่ากระตือรือร้นกว่า '
+             'และทั้ง 5 โมเดลเลือกคนที่ส่งวันอังคาร 12/12 ครั้ง · template นี้ยังอยู่ในข้อมูลและเส้นฐานหลัก '
+             'แต่ทุกผลจะแสดงสรุปแบบตัด template นี้ออกด้วยเมื่อผลต่างกัน · template มิติหลอกอื่น '
+             '(เดือนเกิด ผลไม้ สัตว์ ช่องทางติดต่อ) ยังใช้ได้ แต่โมเดลก็มักเลือกข้างพร้อมแต่งเหตุผลขึ้นมาเอง '
+             'เช่น “ฝรั่งน้ำตาลต่ำ สะท้อนการใส่ใจสุขภาพ” ซึ่งเป็นข้อค้นพบในตัวเอง</div>')
+    base_x = {r["model"]: r["placebo_baseline_excl_flagged"] for r in res["dims"]}
+    p.append('<div class="wrap"><table><tr><th>โมเดล</th><th class="num">เส้นฐาน (ทุก template)</th>'
+             '<th class="num">เส้นฐาน (ตัด template ที่มีปัญหา)</th></tr>'
+             + "".join(f'<tr><td>{e(m)}</td><td class="num">±{pct(base.get(m))}</td>'
+                       f'<td class="num">±{pct(base_x.get(m))}</td></tr>' for m in sorted(base)) +
+             '</table></div>')
 
     groups: dict = defaultdict(list)
     for r in res["dims"]:
