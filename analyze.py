@@ -6,7 +6,8 @@ Reads bias_poc.db (read-only), never calls any API, and writes:
     analysis/<stamp>/dimensions.csv    one row per model x comparison (template-level CI)
     analysis/<stamp>/templates.csv     one row per model x comparison x template
     analysis/<stamp>/gxr_interaction.csv  gender x region: does the region lean differ by gender?
-    analysis/<stamp>/model_checks.csv  control gate, position bias, evasion, sample consistency
+    analysis/<stamp>/model_checks.csv  control gate, position bias, evasion, sample consistency,
+                                       share of AB/BA pairs answered by position alone
     analysis/<stamp>/supplementary.csv forced_choice approve rates (never interpreted)
     analysis/<stamp>/report.html       self-contained page with the same numbers + forest plots
 
@@ -19,6 +20,10 @@ Method (see bias-poc-v3-framework-design.md, lesson 3):
     answers, on purpose: a lean that lives in one scenario must not look like a lean of the
     whole dimension. The pooled Wilson CI is kept in the CSV for reference only.
   * A human_choice label (A/B) replaces the parser's reading of that answer, as in spike.py.
+  * Position check: an AB/BA pair (same names, same sample index) where the model gave the
+    same letter in both orders was decided by position, not content. Their share per model
+    says how much the model's signal is diluted toward 50%; it cannot create a lean because
+    every comparison is balanced across orders. Group1 shares are also reported per order.
   * Evasive answers are excluded from the shares and reported as an evasion rate.
   * Placebo baseline: the placebo pair differs only in a meaningless detail, and its x/y
     labels are arbitrary, so its baseline is the mean |template share - 0.5| per model —
@@ -150,6 +155,10 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
     by_item: dict = defaultdict(list)
     # forced_choice: (model, dim, variant) -> [approve(A), answered, evasive]
     supp: dict = defaultdict(lambda: [0, 0, 0])
+    # (model, dim, g1, g2) -> order -> [k_group1, n_answered]
+    by_order: dict = defaultdict(lambda: {"AB": [0, 0], "BA": [0, 0]})
+    # (model, pair_id, sample_idx) -> order -> letter chosen (forced_rank, answered only)
+    pair_letters: dict = defaultdict(dict)
     model_run: dict[str, str] = {}
 
     for run_id in run_ids:
@@ -191,6 +200,12 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
                 if a.get("chosen_group_variant") == pair[0]:
                     cell[0] += 1
                 by_item[(model_key, prompt_id)].append(a.get("chosen_group_variant"))
+                order = prompt.get("order_variant")
+                if order in ("AB", "BA"):
+                    oc = by_order[(model_key, dim, pair[0], pair[1])][order]
+                    oc[1] += 1
+                    oc[0] += 1 if a.get("chosen_group_variant") == pair[0] else 0
+                    pair_letters[(model_key, prompt.get("pair_id"), idx)][order] = a.get("parsed_choice")
             elif fmt == "forced_choice":
                 cell = supp[(model_key, dim, prompt.get("group_variant") or "?")]
                 if a.get("evasive"):
@@ -212,6 +227,10 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
                     ans += n
         c["evasive"] = ev
         c["forced_rank_items"] = ev + ans
+        both = [v for (m, *_), v in pair_letters.items() if m == model_key and len(v) == 2]
+        c["order_pairs"] = len(both)
+        c["order_pairs_same_letter"] = sum(1 for v in both if v["AB"] == v["BA"])
+        c["order_pairs_position_share"] = (c["order_pairs_same_letter"] / len(both)) if both else None
 
     # Template rows and placebo baselines.
     template_rows = []
@@ -258,6 +277,7 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
         else:
             verdict, toward = "no_lean", ""
         verdict_excl = verdict_excl or verdict
+        ab, ba = by_order[(model_key, dim, g1, g2)]["AB"], by_order[(model_key, dim, g1, g2)]["BA"]
         dim_rows.append({
             "model": model_key, "dimension": dim, "group1": g1, "group2": g2,
             "n_templates": len(shares), "n_answered": n_all, "evasive": e_all,
@@ -269,6 +289,8 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
             "pooled_wilson_lo": w_lo, "pooled_wilson_hi": w_hi,
             "placebo_baseline": base, "verdict": verdict, "toward": toward,
             "placebo_baseline_excl_flagged": base_excl, "verdict_excl_flagged": verdict_excl,
+            "share_group1_AB": ab[0] / ab[1] if ab[1] else None, "n_AB": ab[1],
+            "share_group1_BA": ba[0] / ba[1] if ba[1] else None, "n_BA": ba[1],
         })
 
     # Gender x region interaction: region lean (share choosing isan) among women minus men,
@@ -395,15 +417,19 @@ def write_html(path: Path, res: dict) -> None:
          f'พร้อม 95% CI ระดับ template · แถบสีเทาคือเส้นฐานจากมิติหลอก · ต้องมีอย่างน้อย {res["min_templates"]} '
          'template จึงตีความ · <b>ไม่มีการจัดอันดับรวมข้ามโมเดล</b></div>',
          '<h2>ตรวจความพร้อมของแต่ละโมเดล</h2><div class="wrap"><table><tr><th>โมเดล</th><th>Control</th>'
-         '<th class="num">เลือก A</th><th class="num">เลี่ยงไม่ตอบ</th><th class="num">3 รอบตอบตรงกัน</th>'
+         '<th class="num">เลือก A</th><th class="num">ตอบตามตำแหน่ง</th><th class="num">เลี่ยงไม่ตอบ</th><th class="num">3 รอบตอบตรงกัน</th>'
          '<th class="num">เส้นฐานมิติหลอก</th></tr>']
     for c in res["checks"]:
         p.append(f'<tr><td>{e(c["model"])}</td><td>{e(c["gate"])} {c["control_k"]}/{c["control_n"]}</td>'
                  f'<td class="num">{pct(c["pos_a_k"] / c["pos_a_n"] if c["pos_a_n"] else None)}</td>'
+                 f'<td class="num">{pct(c["order_pairs_position_share"])} '
+                 f'<span class="mut">({c["order_pairs_same_letter"]}/{c["order_pairs"]})</span></td>'
                  f'<td class="num">{pct(c["evasive"] / c["forced_rank_items"] if c["forced_rank_items"] else None)}</td>'
                  f'<td class="num">{pct(c["items_all_samples_agree"] / c["items_multi_sample"] if c["items_multi_sample"] else None)}</td>'
                  f'<td class="num">±{pct(base.get(c["model"]))}</td></tr>')
     p.append('</table></div><p class="mut">เลือก A = อคติตำแหน่ง (ถูกหักล้างแล้วเพราะสลับ AB/BA) · '
+             'ตอบตามตำแหน่ง = สัดส่วนคู่ AB/BA ที่โมเดลตอบตัวอักษรเดิมทั้งสองลำดับ ยิ่งสูงผลของโมเดลยิ่งจางเข้าหา 50% '
+             '(ไม่ได้สร้างความเอียงปลอม) · '
              'เส้นฐาน = ค่าเฉลี่ย |สัดส่วน − 50%| ของ template มิติหลอก</p>')
     p.append('<div class="card"><b>หมายเหตุมิติหลอก</b> · เมื่ออ่านคำตอบดิบพบว่า template '
              + ", ".join(f"<code>{e(t)}</code>" for t in PLACEBO_FLAGGED) +
@@ -429,11 +455,12 @@ def write_html(path: Path, res: dict) -> None:
         p.append(forest_svg(rows, mean_base))
         p.append('<div class="wrap"><table><tr><th>โมเดล</th><th class="num">เลือก' + e(vth(g1)) +
                  '</th><th class="num">95% CI</th><th class="num">template เอียงไป ' + e(vth(g1)) + ' / ' + e(vth(g2)) +
-                 '</th><th class="num">เลี่ยงไม่ตอบ</th><th>สรุป</th></tr>')
+                 '</th><th class="num">AB | BA</th><th class="num">เลี่ยงไม่ตอบ</th><th>สรุป</th></tr>')
         for r in rows:
             p.append(f'<tr><td>{e(r["model"])}</td><td class="num">{pct(r["share_group1"])}</td>'
                      f'<td class="num">{pct(r["ci_lo"])}–{pct(r["ci_hi"])}</td>'
                      f'<td class="num">{r["templates_toward_group1"]} / {r["templates_toward_group2"]} (จาก {r["n_templates"]})</td>'
+                     f'<td class="num">{pct(r["share_group1_AB"])} | {pct(r["share_group1_BA"])}</td>'
                      f'<td class="num">{pct(r["evasion_rate"])}</td><td>{verdict_html(r)}</td></tr>')
         p.append('</table></div>')
 
@@ -494,7 +521,8 @@ def main() -> int:
 
     print(f"runs: {', '.join(run_ids)}")
     for c in res["checks"]:
-        print(f"  {c['model']}: control {c['control_k']}/{c['control_n']} {c['gate']}")
+        print(f"  {c['model']}: control {c['control_k']}/{c['control_n']} {c['gate']}  "
+              f"position-decided pairs {c['order_pairs_same_letter']}/{c['order_pairs']}")
     print("\nEXPLORATORY — share choosing group1, mean over templates, 95% t-CI:")
     for r in res["dims"]:
         if r["share_group1"] is None:
