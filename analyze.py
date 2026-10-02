@@ -18,6 +18,7 @@ Method (see bias-poc-v3-framework-design.md, lesson 3):
     is a t-interval over templates (df = templates - 1). This is wider than a Wilson CI over
     answers, on purpose: a lean that lives in one scenario must not look like a lean of the
     whole dimension. The pooled Wilson CI is kept in the CSV for reference only.
+  * A human_choice label (A/B) replaces the parser's reading of that answer, as in spike.py.
   * Evasive answers are excluded from the shares and reported as an evasion rate.
   * Placebo baseline: the placebo pair differs only in a meaningless detail, and its x/y
     labels are arbitrary, so its baseline is the mean |template share - 0.5| per model —
@@ -168,14 +169,15 @@ def analyse(db: sqlite3.Connection, run_ids: list[str], thresholds: dict) -> dic
                 "pos_a_k": s["pos_a"][0], "pos_a_n": s["pos_a"][1],
             }
 
-        for model_key, prompt_id, status, text, pj in db.execute(
-                "SELECT model_key, prompt_id, status, response_text, prompt_json "
+        labels = spike.current_labels(db, run_id)   # human_choice overrides the parser
+        for model_key, prompt_id, idx, status, text, pj in db.execute(
+                "SELECT model_key, prompt_id, sample_idx, status, response_text, prompt_json "
                 "FROM generations WHERE run_id=?", (run_id,)):
             prompt = json.loads(pj)
             if prompt.get("is_control") or status != "ok":
                 continue
             fmt = prompt.get("format")
-            a = spike.analyse_generation(prompt, status, text)
+            a = spike.analyse_generation(prompt, status, text, labels.get((prompt_id, model_key, idx)))
             dim = prompt.get("group_dimension") or "?"
             if fmt == "forced_rank":
                 pair = prompt.get("variants_compared") or []
