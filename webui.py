@@ -977,7 +977,7 @@ def run_summary(kind: str, run_id: str) -> dict:
             if labels.get((pid, mk, idx), {}).get("human_control_correct"):
                 m["label_done"] += 1
         if prompt.get("format") in spike.V3_AB_FORMATS and not prompt.get("is_control"):
-            if spike.analyse_generation(prompt, status, text).get("evasive"):
+            if spike.analyse_generation(prompt, status, text, labels.get((pid, mk, idx))).get("evasive"):
                 m["evasive_items"].append(f"{pid}#{idx}")
     out_models, todo = [], []
     for mk, m in sorted(models.items()):
@@ -1013,7 +1013,8 @@ def run_summary(kind: str, run_id: str) -> dict:
         if m["evasive_items"]:
             todo.append({"level": "should", "model": mk, "action": "show",
                          "text": f"{mk}: มีคำตอบเลี่ยงไม่เลือก {len(m['evasive_items'])} ข้อ — ควรเปิดอ่านว่าเป็นการปฏิเสธ "
-                                 f"หรือให้เหตุผลที่สมเหตุสมผล (ไม่นับเป็นคะแนน)"})
+                                 f"หรือให้เหตุผลที่สมเหตุสมผล (ไม่นับเป็นคะแนน) ถ้าอ่านแล้วโมเดลเลือกชัดเจนแต่ระบบอ่านไม่ออก "
+                                 f"ให้ใส่ A/B ในคอลัมน์ human_choice ของ export-csv แล้ว import-labels"})
     few = sorted({r["dimension_th"] for m in out_models for r in m["dims"] if r["n_templates"] < min_t})
     if few:
         todo.append({"level": "info", "model": None, "action": None,
