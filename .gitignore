@@ -19,3 +19,6 @@ __pycache__/
 
 # analyze.py output (derived from the DB; publish deliberately)
 analysis/
+
+# Demo video working files (script, raw captures, final.mp4) — never commit video
+demo-video/
